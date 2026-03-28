@@ -1,3 +1,12 @@
+---
+title: Sakha - Hospital Ward Assistant
+emoji: 🏥
+colorFrom: blue
+colorTo: red
+sdk: docker
+app_port: 7860
+---
+
 # Sakha – Ward Assistant OpenEnv Evaluation Environment
 
 ## Motivation
