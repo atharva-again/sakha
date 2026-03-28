@@ -14,6 +14,6 @@ COPY inference.py .
 
 RUN uv pip install --system -e .
 
-EXPOSE 8000
+EXPOSE 7860
 
-CMD ["python", "server/app.py"]
+CMD ["python", "-c", "import uvicorn; from server.app import app; uvicorn.run(app, host='0.0.0.0', port=7860)"]
