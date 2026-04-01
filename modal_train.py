@@ -10,23 +10,20 @@ app = modal.App("sakha-grpo-training")
 
 train_image = (
     modal.Image.debian_slim(python_version="3.12")
-    .apt_install("git")
+    .apt_install("git", "curl", "build-essential")
     .run_commands(
-        "curl -LsSf https://astral.sh/uv/install.sh | sh",
-        env={"PATH": "/root/.cargo/bin:$PATH"},
-    )
-    .run_commands(
+        "curl -LsSf https://astral.sh/uv/install.sh | sh && "
+        "export PATH=/root/.local/bin:$PATH && "
         "uv pip install --system "
         '"git+https://github.com/meta-pytorch/OpenEnv.git" '
         '"pydantic>=2.0" "fastapi>=0.100" "uvicorn>=0.20" '
         '"openai>=1.0" "python-dotenv>=1.0" "tenacity>=8.0" '
         '"torch>=2.5" "accelerate>=1.13" "datasets>=3.0" '
-        '"trl>=1.0.0" '
-        '"transformers==5.4.0"',
-    )
-    .run_commands(
-        "git clone -b grpo-training https://github.com/atharva-again/sakha.git /root/sakha",
+        '"trl>=1.0.0" "jmespath" '
+        '"transformers==5.4.0" && '
+        "git clone -b grpo-training https://github.com/atharva-again/sakha.git /root/sakha && "
         "uv pip install --system -e /root/sakha",
+        env={"PATH": "/root/.local/bin:/usr/local/bin:/usr/bin:/bin:$PATH"},
     )
 )
 

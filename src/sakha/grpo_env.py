@@ -88,7 +88,8 @@ class SakhaToolEnv:
     """
 
     def __init__(self) -> None:
-        self._env = SakhaEnv(base_url=ENV_URL)
+        self._env = SakhaEnv(base_url=ENV_URL).sync()
+        self._env.connect()
         self.reward: float = 0.0
         self._last_obs: SakhaObservation | None = None
 
