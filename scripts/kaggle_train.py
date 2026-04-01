@@ -9,26 +9,25 @@ Expected runtime: ~1.5-2 hours for 200 steps on P100.
 # =============================================================================
 # CELL 1: Clone repo and install dependencies
 # =============================================================================
-# !git clone https://github.com/atharva-again/sakha.git /kaggle/working/sakha
-# %cd /kaggle/working/sakha
-# !pip install -q trl>=1.0.0 accelerate
+!git clone -b grpo-training https://github.com/atharva-again/sakha.git /kaggle/working/sakha
+%cd /kaggle/working/sakha
 
+!curl -LsSf https://astral.sh/uv/install.sh | sh
+sys.path.insert(0, "/kaggle/working/sakha/src")
+!uv sync
+!uv pip install "transformers>=5.2.0"
+!uv pip install -e /kaggle/working/sakha
+
+# =============================================================================
+# CELL 2: Start the Sakha environment server in background
+# =============================================================================
 import os
 import subprocess
 import sys
 import time
 
-subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", "trl>=1.0.0", "accelerate"])
-
-# =============================================================================
-# CELL 2: Start the Sakha environment server in background
-# =============================================================================
-sys.path.insert(0, "/kaggle/working/sakha/src")
-
 server_proc = subprocess.Popen(
     [sys.executable, "server/app.py"],
-    stdout=subprocess.PIPE,
-    stderr=subprocess.PIPE,
 )
 time.sleep(5)
 
@@ -44,11 +43,26 @@ except Exception as e:
 # CELL 3: Import training components
 # =============================================================================
 os.environ["SAKHA_ENV_URL"] = "http://localhost:7860"
+os.environ["TRL_EXPERIMENTAL_SILENCE"] = "1"
 
 from datasets import Dataset
 from trl import GRPOConfig, GRPOTrainer
+from transformers import AutoTokenizer
 
 from sakha.grpo_env import SakhaToolEnv
+
+# Fix: manually set response_schema for Qwen2.5 tokenizer
+# TRL's add_response_schema() doesn't recognize Qwen2.5's chat template
+tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen2.5-0.5B")
+qwen3_5_schema = {
+    "type": "object",
+    "properties": {
+        "name": {"type": "string"},
+        "arguments": {"type": "object"},
+    },
+    "required": ["name", "arguments"],
+}
+tokenizer.response_schema = qwen3_5_schema
 
 # =============================================================================
 # CELL 4: Build training dataset
@@ -102,10 +116,11 @@ def reward_func(environments: list[SakhaToolEnv], **kwargs) -> list[float]:
 # =============================================================================
 config = GRPOConfig(
     num_generations=4,
-    max_completion_length=2048,
+    max_completion_length=1024,  # Lower to avoid regex hang (#5415)
+    max_tool_calling_iterations=10,  # Prevent long tool chains
     per_device_train_batch_size=2,
     gradient_accumulation_steps=8,
-    learning_rate=1e-6,
+    learning_rate=1e-5,
     max_steps=200,
     logging_steps=10,
     save_steps=50,
@@ -113,14 +128,18 @@ config = GRPOConfig(
     report_to="none",
     chat_template_kwargs={"enable_thinking": False},
     log_completions=True,
+    use_vllm=True,
+    vllm_mode="server",  # Avoids colocate issue (#5269)
+    vllm_gpu_memory_utilization=0.4,
 )
 
 trainer = GRPOTrainer(
-    model="Qwen/Qwen2.5-0.5B",
+    model="Qwen/Qwen3.5-4B",
     train_dataset=dataset,
     reward_funcs=reward_func,
     args=config,
     environment_factory=SakhaToolEnv,
+    processing_class=tokenizer,
 )
 
 trainer.train()
