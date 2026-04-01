@@ -104,7 +104,9 @@ class SakhaToolEnv:
     def reset(self, seed: int | None = None, **kwargs: Any) -> str | None:
         self._ensure_async()
         self.reward = 0.0
-        self._last_obs = self._loop.run_until_complete(self._env.reset(seed=seed))
+        result = self._loop.run_until_complete(self._env.reset(seed=seed))
+        self._last_obs = result.observation
+        print(f"DEBUG reset: type(result)={type(result)}, type(observation)={type(result.observation)}")
         return _format_ward_state(self._last_obs)
 
     def _step(self, action: SakhaAction) -> SakhaObservation:
@@ -113,6 +115,7 @@ class SakhaToolEnv:
 
     def _step_with_reward(self, action: SakhaAction) -> tuple[float, SakhaObservation]:
         result = self._loop.run_until_complete(self._env.step(action))
+        print(f"DEBUG step: type(result)={type(result)}, reward={result.reward}, obs_type={type(result.observation)}")
         return result.reward, result.observation
 
     def check_vitals(self, patient_id: int) -> str:
