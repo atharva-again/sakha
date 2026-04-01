@@ -49,10 +49,15 @@ def train():
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
     )
-    time.sleep(10)
-    stdout, stderr = server_proc.communicate(timeout=1)
-    print(f"DEBUG server stdout: {stdout}")
-    print(f"DEBUG server stderr: {stderr}")
+    print(f"DEBUG: Started server with PID {server_proc.pid}")
+    time.sleep(5)
+    if server_proc.poll() is not None:
+        stdout, stderr = server_proc.communicate()
+        print(f"DEBUG server exited early!")
+        print(f"DEBUG server stdout: {stdout}")
+        print(f"DEBUG server stderr: {stderr}")
+    else:
+        print("DEBUG: Server is running")
 
     os.environ["SAKHA_ENV_URL"] = "http://localhost:7860"
     os.environ["TRL_EXPERIMENTAL_SILENCE"] = "1"
