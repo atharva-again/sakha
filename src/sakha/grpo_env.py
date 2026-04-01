@@ -93,12 +93,20 @@ class SakhaToolEnv:
         self._last_obs: SakhaObservation | None = None
 
     def _run(self, coro):
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        try:
-            return loop.run_until_complete(coro)
-        finally:
-            loop.close()
+        print(f"DEBUG _run: input type={type(coro)}")
+        if asyncio.iscoroutine(coro):
+            print("DEBUG: it's a coroutine, running it")
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            try:
+                result = loop.run_until_complete(coro)
+                print(f"DEBUG: after run_until_complete, result type={type(result)}")
+                return result
+            finally:
+                loop.close()
+        else:
+            print("DEBUG: not a coroutine, returning as-is")
+            return coro
 
     def reset(self, seed: int | None = None, **kwargs: Any) -> str | None:
         self.reward = 0.0
