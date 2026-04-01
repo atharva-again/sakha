@@ -95,10 +95,14 @@ class SakhaToolEnv:
         self._connected = False
 
     def _ensure_async(self) -> None:
+        print(f"DEBUG _ensure_async: _connected={self._connected}")
         if not self._connected:
+            print("DEBUG: Creating new event loop")
             self._loop = asyncio.new_event_loop()
             asyncio.set_event_loop(self._loop)
+            print("DEBUG: About to connect")
             self._loop.run_until_complete(self._env.connect())
+            print("DEBUG: Connected")
             self._connected = True
 
     def reset(self, seed: int | None = None, **kwargs: Any) -> str | None:
