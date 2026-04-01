@@ -211,13 +211,11 @@ class WardState(BaseModel):
     total_tasks_completed: int = 0
     total_tasks_missed: int = 0
 
-    @field_validator("patients", mode="before")
+    @field_validator("patients", mode="wrap")
     @classmethod
-    def _deep_copy_patients(cls, v):
-        """Ensure patients are deep copied to prevent external mutation."""
-        if isinstance(v, list):
-            return [p.model_copy(deep=True) for p in v]
-        return v
+    def _deep_copy_patients(cls, v, handler):
+        patients = handler(v)
+        return [p.model_copy(deep=True) for p in patients]
 
     @property
     def admitted_patients(self) -> list[PatientState]:
