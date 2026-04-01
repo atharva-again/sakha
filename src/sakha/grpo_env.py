@@ -6,6 +6,7 @@ Wraps SakhaEnv into the format TRL's GRPOTrainer expects:
 - self.reward accumulates per episode for reward_func extraction
 """
 
+import asyncio
 import os
 from typing import Any
 
@@ -90,23 +91,23 @@ class SakhaToolEnv:
         self._env = SakhaEnv(base_url=ENV_URL)
         self.reward: float = 0.0
         self._last_obs: SakhaObservation | None = None
-        self._connected = False
 
-    def _sync_step(self, action: SakhaAction) -> tuple[float, SakhaObservation]:
-        with self._env.sync() as sync_env:
-            result = sync_env.step(action)
-        return result.reward, result.observation
+    def _run(self, coro):
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        try:
+            return loop.run_until_complete(coro)
+        finally:
+            loop.close()
 
     def reset(self, seed: int | None = None, **kwargs: Any) -> str | None:
-        with self._env.sync() as sync_env:
-            result = sync_env.reset(seed=seed)
         self.reward = 0.0
+        result = self._run(self._env.reset(seed=seed))
         self._last_obs = result.observation
         return _format_ward_state(self._last_obs)
 
     def _sync_step(self, action: SakhaAction) -> tuple[float, SakhaObservation]:
-        with self._env.sync() as sync_env:
-            result = sync_env.step(action)
+        result = self._run(self._env.step(action))
         return result.reward, result.observation
 
     def check_vitals(self, patient_id: int) -> str:

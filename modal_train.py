@@ -49,7 +49,8 @@ def train():
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
     )
-    time.sleep(5)
+    time.sleep(10)
+    print("Server started, waiting for it to be ready...")
 
     os.environ["SAKHA_ENV_URL"] = "http://localhost:7860"
     os.environ["TRL_EXPERIMENTAL_SILENCE"] = "1"
