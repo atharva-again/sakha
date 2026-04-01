@@ -6,7 +6,6 @@ Wraps SakhaEnv into the format TRL's GRPOTrainer expects:
 - self.reward accumulates per episode for reward_func extraction
 """
 
-import asyncio
 import os
 from typing import Any
 
@@ -89,47 +88,35 @@ class SakhaToolEnv:
 
     def __init__(self) -> None:
         self._env = SakhaEnv(base_url=ENV_URL)
-        self._loop: asyncio.AbstractEventLoop | None = None
         self.reward: float = 0.0
         self._last_obs: SakhaObservation | None = None
         self._connected = False
 
-    def _ensure_async(self) -> None:
-        print(f"DEBUG _ensure_async: _connected={self._connected}")
-        if not self._connected:
-            print("DEBUG: Creating new event loop")
-            self._loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(self._loop)
-            print("DEBUG: About to connect")
-            self._loop.run_until_complete(self._env.connect())
-            print("DEBUG: Connected")
-            self._connected = True
+    def _sync_step(self, action: SakhaAction) -> tuple[float, SakhaObservation]:
+        with self._env.sync() as sync_env:
+            result = sync_env.step(action)
+        return result.reward, result.observation
 
     def reset(self, seed: int | None = None, **kwargs: Any) -> str | None:
-        self._ensure_async()
+        with self._env.sync() as sync_env:
+            result = sync_env.reset(seed=seed)
         self.reward = 0.0
-        result = self._loop.run_until_complete(self._env.reset(seed=seed))
         self._last_obs = result.observation
-        print(f"DEBUG reset: type(result)={type(result)}, type(observation)={type(result.observation)}")
         return _format_ward_state(self._last_obs)
 
-    def _step(self, action: SakhaAction) -> SakhaObservation:
-        result = self._loop.run_until_complete(self._env.step(action))
-        return result.observation
-
-    def _step_with_reward(self, action: SakhaAction) -> tuple[float, SakhaObservation]:
-        result = self._loop.run_until_complete(self._env.step(action))
-        print(f"DEBUG step: type(result)={type(result)}, reward={result.reward}, obs_type={type(result.observation)}")
+    def _sync_step(self, action: SakhaAction) -> tuple[float, SakhaObservation]:
+        with self._env.sync() as sync_env:
+            result = sync_env.step(action)
         return result.reward, result.observation
 
     def check_vitals(self, patient_id: int) -> str:
-        reward, obs = self._step_with_reward(SakhaAction(action_type="check_vitals", patient_id=patient_id))
+        reward, obs = self._sync_step(SakhaAction(action_type="check_vitals", patient_id=patient_id))
         self.reward += reward
         self._last_obs = obs
         return _format_action_result("check_vitals", patient_id, obs, reward)
 
     def administer_medicine(self, patient_id: int) -> str:
-        reward, obs = self._step_with_reward(
+        reward, obs = self._sync_step(
             SakhaAction(action_type="administer_medicine", patient_id=patient_id)
         )
         self.reward += reward
@@ -137,31 +124,31 @@ class SakhaToolEnv:
         return _format_action_result("administer_medicine", patient_id, obs, reward)
 
     def escalate(self, patient_id: int) -> str:
-        reward, obs = self._step_with_reward(SakhaAction(action_type="escalate", patient_id=patient_id))
+        reward, obs = self._sync_step(SakhaAction(action_type="escalate", patient_id=patient_id))
         self.reward += reward
         self._last_obs = obs
         return _format_action_result("escalate", patient_id, obs, reward)
 
     def document(self, patient_id: int) -> str:
-        reward, obs = self._step_with_reward(SakhaAction(action_type="document", patient_id=patient_id))
+        reward, obs = self._sync_step(SakhaAction(action_type="document", patient_id=patient_id))
         self.reward += reward
         self._last_obs = obs
         return _format_action_result("document", patient_id, obs, reward)
 
     def communicate(self) -> str:
-        reward, obs = self._step_with_reward(SakhaAction(action_type="communicate"))
+        reward, obs = self._sync_step(SakhaAction(action_type="communicate"))
         self.reward += reward
         self._last_obs = obs
         return _format_action_result("communicate", None, obs, reward)
 
     def handover(self) -> str:
-        reward, obs = self._step_with_reward(SakhaAction(action_type="handover"))
+        reward, obs = self._sync_step(SakhaAction(action_type="handover"))
         self.reward += reward
         self._last_obs = obs
         return _format_action_result("handover", None, obs, reward)
 
     def noop(self) -> str:
-        reward, obs = self._step_with_reward(SakhaAction(action_type="noop"))
+        reward, obs = self._sync_step(SakhaAction(action_type="noop"))
         self.reward += reward
         self._last_obs = obs
         return _format_action_result("noop", None, obs, reward)
