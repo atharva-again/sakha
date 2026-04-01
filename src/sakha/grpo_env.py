@@ -6,6 +6,7 @@ Wraps SakhaEnv into the format TRL's GRPOTrainer expects:
 - self.reward accumulates per episode for reward_func extraction
 """
 
+import asyncio
 import os
 from typing import Any
 
@@ -69,14 +70,13 @@ def _format_ward_state(obs: SakhaObservation) -> str:
 
 
 def _format_action_result(
-    action_type: str, patient_id: int | None, result: SakhaObservation
+    action_type: str, patient_id: int | None, obs: SakhaObservation, reward: float
 ) -> str:
-    """Format the result of an action as a concise string."""
     parts = [f"Action: {action_type}"]
     if patient_id is not None:
         parts.append(f"Patient: {patient_id}")
-    parts.append(f"Reward: {result.reward:+.2f}")
-    parts.append(f"Step: {result.ward_state.current_step}")
+    parts.append(f"Reward: {reward:+.2f}")
+    parts.append(f"Step: {obs.ward_state.current_step}")
     return " | ".join(parts)
 
 
@@ -88,136 +88,73 @@ class SakhaToolEnv:
     """
 
     def __init__(self) -> None:
-        self._env = SakhaEnv(base_url=ENV_URL).sync()
-        self._env.connect()
+        self._env = SakhaEnv(base_url=ENV_URL)
+        self._loop: asyncio.AbstractEventLoop | None = None
         self.reward: float = 0.0
         self._last_obs: SakhaObservation | None = None
+        self._connected = False
+
+    def _ensure_async(self) -> None:
+        if not self._connected:
+            self._loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(self._loop)
+            self._loop.run_until_complete(self._env.connect())
+            self._connected = True
 
     def reset(self, seed: int | None = None, **kwargs: Any) -> str | None:
-        """Reset the environment and return the initial ward state.
-
-        Args:
-            seed: Optional random seed for reproducibility.
-
-        Returns:
-            Formatted ward state as a natural language string.
-        """
+        self._ensure_async()
         self.reward = 0.0
-        self._last_obs = self._env.reset(seed=seed)
+        self._last_obs = self._loop.run_until_complete(self._env.reset(seed=seed))
         return _format_ward_state(self._last_obs)
 
+    def _step(self, action: SakhaAction) -> SakhaObservation:
+        result = self._loop.run_until_complete(self._env.step(action))
+        return result.observation
+
+    def _step_with_reward(self, action: SakhaAction) -> tuple[float, SakhaObservation]:
+        result = self._loop.run_until_complete(self._env.step(action))
+        return result.reward, result.observation
+
     def check_vitals(self, patient_id: int) -> str:
-        """Check the vital signs of a specific patient.
-
-        Use this to monitor patient health and detect deterioration early.
-        Only returns useful results when vitals are actually due.
-
-        Args:
-            patient_id: The ID of the patient to check.
-
-        Returns:
-            Result of the vitals check including reward and current step.
-        """
-        result = self._env.step(SakhaAction(action_type="check_vitals", patient_id=patient_id))
-        self.reward += result.reward
-        self._last_obs = result.observation
-        return _format_action_result("check_vitals", patient_id, result)
+        reward, obs = self._step_with_reward(SakhaAction(action_type="check_vitals", patient_id=patient_id))
+        self.reward += reward
+        self._last_obs = obs
+        return _format_action_result("check_vitals", patient_id, obs, reward)
 
     def administer_medicine(self, patient_id: int) -> str:
-        """Administer the next due medication to a patient.
-
-        Give the patient's next scheduled medication. The environment
-        automatically selects the correct medicine — you just choose the patient.
-        Only works when the patient actually has medication due.
-
-        Args:
-            patient_id: The ID of the patient to treat.
-
-        Returns:
-            Result of the administration including reward and current step.
-        """
-        result = self._env.step(
-            SakhaAction(
-                action_type="administer_medicine",
-                patient_id=patient_id,
-            )
+        reward, obs = self._step_with_reward(
+            SakhaAction(action_type="administer_medicine", patient_id=patient_id)
         )
-        self.reward += result.reward
-        self._last_obs = result.observation
-        return _format_action_result("administer_medicine", patient_id, result)
+        self.reward += reward
+        self._last_obs = obs
+        return _format_action_result("administer_medicine", patient_id, obs, reward)
 
     def escalate(self, patient_id: int) -> str:
-        """Escalate a critical patient to higher-level care.
-
-        Use when a patient's condition is deteriorating and requires
-        immediate senior intervention. Critical for safety scoring.
-
-        Args:
-            patient_id: The ID of the patient to escalate.
-
-        Returns:
-            Result of the escalation including reward and current step.
-        """
-        result = self._env.step(SakhaAction(action_type="escalate", patient_id=patient_id))
-        self.reward += result.reward
-        self._last_obs = result.observation
-        return _format_action_result("escalate", patient_id, result)
+        reward, obs = self._step_with_reward(SakhaAction(action_type="escalate", patient_id=patient_id))
+        self.reward += reward
+        self._last_obs = obs
+        return _format_action_result("escalate", patient_id, obs, reward)
 
     def document(self, patient_id: int) -> str:
-        """Document the current status of a patient.
-
-        Record clinical notes for the patient's file.
-        Useful during downtime to maintain documentation quality.
-
-        Args:
-            patient_id: The ID of the patient to document.
-
-        Returns:
-            Result of the documentation action including reward and current step.
-        """
-        result = self._env.step(SakhaAction(action_type="document", patient_id=patient_id))
-        self.reward += result.reward
-        self._last_obs = result.observation
-        return _format_action_result("document", patient_id, result)
+        reward, obs = self._step_with_reward(SakhaAction(action_type="document", patient_id=patient_id))
+        self.reward += reward
+        self._last_obs = obs
+        return _format_action_result("document", patient_id, obs, reward)
 
     def communicate(self) -> str:
-        """Communicate with the care team.
-
-        Share information with other staff members.
-        Useful during downtime to improve team coordination.
-
-        Returns:
-            Result of the communication action including reward and current step.
-        """
-        result = self._env.step(SakhaAction(action_type="communicate"))
-        self.reward += result.reward
-        self._last_obs = result.observation
-        return _format_action_result("communicate", None, result)
+        reward, obs = self._step_with_reward(SakhaAction(action_type="communicate"))
+        self.reward += reward
+        self._last_obs = obs
+        return _format_action_result("communicate", None, obs, reward)
 
     def handover(self) -> str:
-        """Complete the shift handover.
-
-        Transfer responsibility to the incoming shift.
-        Should be done near the end of the shift for maximum score.
-
-        Returns:
-            Result of the handover action including reward and current step.
-        """
-        result = self._env.step(SakhaAction(action_type="handover"))
-        self.reward += result.reward
-        self._last_obs = result.observation
-        return _format_action_result("handover", None, result)
+        reward, obs = self._step_with_reward(SakhaAction(action_type="handover"))
+        self.reward += reward
+        self._last_obs = obs
+        return _format_action_result("handover", None, obs, reward)
 
     def noop(self) -> str:
-        """Take no action this step.
-
-        Use only when no productive actions are available.
-        Each noop incurs a small penalty.
-
-        Returns:
-            Result of the noop action including reward and current step.
-        """
-        result = self._env.step(SakhaAction(action_type="noop"))
-        self.reward += result.reward
-        self._last_obs = result.observation
-        return _format_action_result("noop", None, result)
+        reward, obs = self._step_with_reward(SakhaAction(action_type="noop"))
+        self.reward += reward
+        self._last_obs = obs
+        return _format_action_result("noop", None, obs, reward)
