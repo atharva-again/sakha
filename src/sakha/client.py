@@ -22,6 +22,8 @@ class SakhaEnv(EnvClient[SakhaAction, SakhaObservation, State]):
             ward_state=WardState.model_validate(obs_data.get("ward_state", {})),
             pending_count=obs_data.get("pending_count", 0),
             time_remaining_minutes=obs_data.get("time_remaining_minutes", 0),
+            shift_hour=obs_data.get("shift_hour", 0),
+            nurse_fatigue=obs_data.get("nurse_fatigue", 0.0),
             metadata=obs_data.get("metadata", {}),
         )
         return StepResult(

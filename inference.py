@@ -14,11 +14,10 @@ Usage:
     python inference.py --tasks easy,medium,hard --seed 42 --episodes 3
 """
 
+import argparse
+import json
 import os
 import sys
-import json
-import re
-import argparse
 import textwrap
 import time
 from pathlib import Path
@@ -27,9 +26,9 @@ from dotenv import load_dotenv
 from openai import OpenAI
 from tenacity import (
     retry,
+    retry_if_exception_type,
     stop_after_attempt,
     wait_exponential,
-    retry_if_exception_type,
 )
 
 load_dotenv()
@@ -48,6 +47,7 @@ def call_llm_with_retry(client, messages):
             messages=messages,
             temperature=TEMPERATURE,
             max_tokens=MAX_TOKENS,
+            response_format={"type": "json_object"},
         )
         return completion
     except Exception as exc:
@@ -57,9 +57,13 @@ def call_llm_with_retry(client, messages):
 
 
 from sakha.env import SakhaEnvironment
-from sakha.models import SakhaAction, SakhaObservation
-from sakha.graders import score_easy_task, score_medium_task, score_hard_task
-
+from sakha.graders import score_easy_task, score_hard_task, score_medium_task
+from sakha.models import (
+    ActionType,
+    PatientStatus,
+    SakhaAction,
+    SakhaObservation,
+)
 
 API_BASE_URL = os.getenv("API_BASE_URL", "https://router.huggingface.co/v1")
 API_KEY = os.getenv("HF_TOKEN") or os.getenv("API_KEY") or os.getenv("OPENAI_API_KEY")
@@ -68,11 +72,14 @@ MODEL_NAME = os.getenv("MODEL_NAME", "microsoft/Phi-3-mini-4k-instruct")
 MAX_STEPS = 96
 TEMPERATURE = 0.2
 MAX_TOKENS = 150
-FALLBACK_ACTION = SakhaAction(action_type="check_vitals", patient_id=1)
+FALLBACK_ACTION = SakhaAction(action_type=ActionType.CHECK_VITALS, patient_id=1)
 ACTION_ID_TO_TYPE = {
-    "A1": "administer_medicine",
-    "A2": "check_vitals",
-    "A3": "escalate",
+    "A1": ActionType.ADMINISTER_MEDICINE,
+    "A2": ActionType.CHECK_VITALS,
+    "A3": ActionType.ESCALATE,
+    "A4": ActionType.DOCUMENT,
+    "A5": ActionType.COMMUNICATE,
+    "A6": ActionType.HANDOVER,
 }
 
 TASK_GRADERS = {
@@ -84,43 +91,36 @@ TASK_GRADERS = {
 
 SYSTEM_PROMPT = textwrap.dedent(
     """
-    You are a hospital ward assistant AI managing patient care.
+    You are a hospital ward assistant AI managing patient care in a realistic ward.
 
-    Your task is to select one action from a fixed policy table using only the current state.
+    Your task is to select one action using the current state.
 
     ACTION IDS:
     - A1 = administer_medicine(patient_id)
     - A2 = check_vitals(patient_id)
-    - A3 = escalate(patient_id)
+    - A3 = escalate(patient_id)  - urgent for critical patients
+    - A4 = document(patient_id)  - record patient status
+    - A5 = communicate()  - coordinate with team
+    - A6 = handover()  - shift change briefing
 
-    POLICY TABLE:
-    - A1 trigger: patient_id is in meds_due_patients
-      blocker: patient_id not in meds_due_patients
-      evidence needed: meds_due_patients contains patient_id
-    - A2 trigger: patient_id is in vitals_due_patients
-      blocker: patient_id not in vitals_due_patients
-      evidence needed: vitals_due_patients contains patient_id
-    - A3 trigger: patient_id is in critical_patients
-      blocker: patient_id not in critical_patients
-      evidence needed: critical_patients contains patient_id
+    PRIORITY RULES (in order):
+    1. ESCALATE any patient with escalation_level >= 2 (critical)
+    2. CHECK_VITALS for patients with vitals due who are critical or elevated
+    3. ADMINISTER_MEDICINE for patients with medications due
+    4. CHECK_VITALS for any patient with vitals due
+    5. DOCUMENT for patients not recently documented
+    6. HANDOVER when shift is ending (hour 7+)
+    7. NOOP only when nothing urgent
 
-    DECISION RULES:
-    1. Read the state first.
-    2. Mark actions eligible only when their trigger is satisfied.
-    3. Do not choose an ineligible action.
-    4. If multiple actions are eligible, prefer the highest-priority action for the current state:
-       critical_patients first, then meds_due_patients, then vitals_due_patients.
-    5. If the same action_id appears repeatedly in recent_action_ids while other eligible action_ids exist, pick a different eligible action.
-    6. Choose using patient ids from the state, not habit.
+    CONSTRAINTS:
+    - Max 3 actions per step (nurse fatigue)
+    - Tasks have deadlines - on-time completion scores higher
+    - New patients may arrive - check waiting queue
+    - Patients may deteriorate - monitor trends
 
-    REQUIRED OUTPUT FORMAT:
-    Return exactly one JSON object with this shape:
+    OUTPUT FORMAT:
+    Return exactly one JSON object:
     {
-      "eligible_actions": [
-        {"id": "A1", "patient_id": 1, "eligible": true},
-        {"id": "A2", "patient_id": 1, "eligible": true},
-        {"id": "A3", "patient_id": 1, "eligible": false}
-      ],
       "chosen_action_id": "A1",
       "chosen_patient_id": 1
     }
@@ -133,47 +133,53 @@ SYSTEM_PROMPT = textwrap.dedent(
 def build_user_prompt(observation: SakhaObservation, step: int, history: list[str]) -> str:
     ward = observation.ward_state
 
+    admitted_patients = []
+    waiting_count = 0
+    critical_count = 0
+
+    if hasattr(ward, 'admitted_patients'):
+        admitted_patients = list(ward.admitted_patients)
+        waiting_count = len(ward.waiting_patients) if hasattr(ward, 'waiting_patients') else 0
+        critical_count = len(ward.critical_patients) if hasattr(ward, 'critical_patients') else 0
+    else:
+        admitted_patients = list(ward.patients) if hasattr(ward, 'patients') else []
+
     critical_patients = []
     meds_due_patients = []
     vitals_due_patients = []
     elevated_patients = []
-    abnormal_vitals_patients = []
 
-    for p in ward.patients:
-        if p.escalation_level >= 2:
-            critical_patients.append(p.bed_id)
-        elif p.escalation_level == 1:
-            elevated_patients.append(p.bed_id)
+    for p in admitted_patients:
+        pid = p.patient_id if hasattr(p, 'patient_id') else getattr(p, 'bed_id', 0)
+        escalation = getattr(p, 'escalation_level', 0)
 
-        if p.medications_due:
-            meds_due_patients.append({"patient_id": p.bed_id, "count": len(p.medications_due)})
+        if escalation >= 2:
+            critical_patients.append(pid)
+        elif escalation >= 1:
+            elevated_patients.append(pid)
 
-        if p.vitals_due:
-            vitals_due_patients.append(p.bed_id)
+        meds = getattr(p, 'medications_due', [])
+        if meds:
+            meds_due_patients.append({"patient_id": pid, "count": len(meds)})
 
-        if p.last_vitals:
-            v = p.last_vitals
-            if v.temperature >= 39.0 or v.spo2 < 93 or v.pulse >= 100:
-                abnormal_vitals_patients.append(
-                    {
-                        "patient_id": p.bed_id,
-                        "temp": v.temperature,
-                        "spo2": v.spo2,
-                        "pulse": v.pulse,
-                    }
-                )
+        vitals = getattr(p, 'vitals_due', False)
+        if vitals:
+            vitals_due_patients.append(pid)
 
     recent_action_ids = [item.split(":", 1)[0] for item in history[-3:]] if history else []
 
     state_payload = {
         "step": step,
+        "shift_hour": getattr(observation, 'shift_hour', step // 12),
+        "nurse_fatigue": round(getattr(observation, 'nurse_fatigue', 0), 2),
         "time_remaining_minutes": observation.time_remaining_minutes,
-        "pending_count": observation.pending_count,
+        "admitted_count": len(admitted_patients),
+        "waiting_count": waiting_count,
+        "critical_count": critical_count,
         "critical_patients": critical_patients,
         "elevated_patients": elevated_patients,
         "meds_due_patients": meds_due_patients,
         "vitals_due_patients": vitals_due_patients,
-        "abnormal_vitals_patients": abnormal_vitals_patients,
         "recent_action_ids": recent_action_ids,
     }
 
@@ -182,23 +188,29 @@ def build_user_prompt(observation: SakhaObservation, step: int, history: list[st
         STATE JSON:
         {json.dumps(state_payload, separators=(",", ":"))}
 
-        Produce the required JSON decision now."""
+        Choose the best action now."""
     ).strip()
 
 
-JSON_BLOCK_PATTERN = re.compile(r"\{.*\}", re.DOTALL)
-
-
 def build_fallback_action(observation: SakhaObservation) -> SakhaAction:
-    for patient in observation.ward_state.patients:
-        if patient.escalation_level >= 2:
-            return SakhaAction(action_type="escalate", patient_id=patient.bed_id)
-    for patient in observation.ward_state.patients:
-        if patient.medications_due:
-            return SakhaAction(action_type="administer_medicine", patient_id=patient.bed_id)
-    for patient in observation.ward_state.patients:
-        if patient.vitals_due:
-            return SakhaAction(action_type="check_vitals", patient_id=patient.bed_id)
+    ward = observation.ward_state
+    patients = ward.admitted_patients if hasattr(ward, 'admitted_patients') else ward.patients
+
+    for patient in patients:
+        if getattr(patient, 'escalation_level', 0) >= 2:
+            pid = getattr(patient, 'patient_id', getattr(patient, 'bed_id', 1))
+            return SakhaAction(action_type=ActionType.ESCALATE, patient_id=pid)
+
+    for patient in patients:
+        if getattr(patient, 'vitals_due', False):
+            pid = getattr(patient, 'patient_id', getattr(patient, 'bed_id', 1))
+            return SakhaAction(action_type=ActionType.CHECK_VITALS, patient_id=pid)
+
+    for patient in patients:
+        if getattr(patient, 'medications_due', []):
+            pid = getattr(patient, 'patient_id', getattr(patient, 'bed_id', 1))
+            return SakhaAction(action_type=ActionType.ADMINISTER_MEDICINE, patient_id=pid)
+
     return FALLBACK_ACTION
 
 
@@ -206,106 +218,136 @@ def extract_model_decision(response_text: str) -> dict | None:
     if not response_text:
         return None
 
-    text = response_text.strip()
-    text = re.sub(r"```python\s*", "", text)
-    text = re.sub(r"```json\s*", "", text)
-    text = re.sub(r"```\s*", "", text)
-    text = re.sub(r"^(action|next action|response)\s*[:\-]\s*", "", text, flags=re.IGNORECASE)
-
-    match = JSON_BLOCK_PATTERN.search(text)
-    if not match:
-        return None
-
     try:
-        return json.loads(match.group(0))
+        return json.loads(response_text)
     except json.JSONDecodeError:
         return None
 
 
 def get_patient(observation: SakhaObservation, patient_id: int):
+    ward = observation.ward_state
+    patients = ward.admitted_patients if hasattr(ward, 'admitted_patients') else ward.patients
     return next(
-        (p for p in observation.ward_state.patients if p.bed_id == patient_id),
+        (p for p in patients if getattr(p, 'patient_id', getattr(p, 'bed_id', None)) == patient_id),
         None,
     )
 
 
 def get_eligible_candidates(observation: SakhaObservation) -> dict[str, list[int]]:
-    return {
-        "A3": [p.bed_id for p in observation.ward_state.patients if p.escalation_level >= 2],
-        "A1": [p.bed_id for p in observation.ward_state.patients if p.medications_due],
-        "A2": [p.bed_id for p in observation.ward_state.patients if p.vitals_due],
+    ward = observation.ward_state
+    patients = ward.admitted_patients if hasattr(ward, 'admitted_patients') else ward.patients
+
+    candidates = {
+        "A3": [],
+        "A1": [],
+        "A2": [],
     }
+
+    for p in patients:
+        pid = getattr(p, 'patient_id', getattr(p, 'bed_id', 0))
+
+        if getattr(p, 'escalation_level', 0) >= 2:
+            candidates["A3"].append(pid)
+
+        if getattr(p, 'medications_due', []):
+            candidates["A1"].append(pid)
+
+        if getattr(p, 'vitals_due', False):
+            candidates["A2"].append(pid)
+
+    return candidates
 
 
 def has_abnormal_vitals(patient) -> bool:
-    if patient.last_vitals is None:
+    vitals = getattr(patient, 'vitals', None)
+    if vitals is None:
         return False
-    v = patient.last_vitals
-    return v.temperature >= 39.0 or v.spo2 < 93 or v.pulse >= 100
+    return vitals.temperature >= 38.5 or vitals.spo2 < 94 or vitals.pulse >= 100
 
 
-def rank_candidates(observation: SakhaObservation) -> list[tuple[int, str, int]]:
-    ranked: list[tuple[int, str, int]] = []
+def priority_policy(observation: SakhaObservation) -> SakhaAction:
+    ward = observation.ward_state
+    patients = ward.admitted_patients if hasattr(ward, 'admitted_patients') else ward.patients
 
-    for patient in observation.ward_state.patients:
-        bed_id = patient.bed_id
-        elevated = patient.escalation_level >= 1
-        abnormal = has_abnormal_vitals(patient)
+    for patient in patients:
+        if getattr(patient, 'escalation_level', 0) >= 2:
+            pid = getattr(patient, 'patient_id', getattr(patient, 'bed_id', 1))
+            return SakhaAction(action_type=ActionType.ESCALATE, patient_id=pid)
 
-        if patient.escalation_level >= 2:
-            ranked.append((1000 + patient.escalation_level, "A3", bed_id))
+    for patient in patients:
+        if getattr(patient, 'vitals_due', False) and getattr(patient, 'escalation_level', 0) >= 1:
+            pid = getattr(patient, 'patient_id', getattr(patient, 'bed_id', 1))
+            return SakhaAction(action_type=ActionType.CHECK_VITALS, patient_id=pid)
 
-        if patient.vitals_due:
-            vitals_score = 400
-            if elevated:
-                vitals_score += 120
-            if abnormal:
-                vitals_score += 100
-            ranked.append((vitals_score, "A2", bed_id))
+    for patient in patients:
+        if getattr(patient, 'vitals_due', False) and has_abnormal_vitals(patient):
+            pid = getattr(patient, 'patient_id', getattr(patient, 'bed_id', 1))
+            return SakhaAction(action_type=ActionType.CHECK_VITALS, patient_id=pid)
 
-        if patient.medications_due:
-            meds_score = 300 + len(patient.medications_due) * 10
-            if elevated:
-                meds_score += 40
-            ranked.append((meds_score, "A1", bed_id))
+    for patient in patients:
+        if getattr(patient, 'medications_due', []):
+            pid = getattr(patient, 'patient_id', getattr(patient, 'bed_id', 1))
+            return SakhaAction(action_type=ActionType.ADMINISTER_MEDICINE, patient_id=pid)
 
-    ranked.sort(key=lambda item: (-item[0], item[2], item[1]))
-    return ranked
+    checked_this_round = set()
+    for patient in patients:
+        if getattr(patient, 'vitals_due', False):
+            pid = getattr(patient, 'patient_id', getattr(patient, 'bed_id', 1))
+            if pid not in checked_this_round:
+                checked_this_round.add(pid)
+                return SakhaAction(action_type=ActionType.CHECK_VITALS, patient_id=pid)
+
+    shift_hour = getattr(observation, 'shift_hour', 0)
+    if shift_hour >= 7:
+        nurse = getattr(ward, 'nurse', None)
+        if nurse and not getattr(nurse, 'handover_completed', True):
+            return SakhaAction(action_type=ActionType.HANDOVER)
+
+    return SakhaAction(action_type=ActionType.NOOP)
 
 
 def choose_balanced_action(
     observation: SakhaObservation, history: list[str], model_payload: dict | None
 ) -> SakhaAction:
     eligible = get_eligible_candidates(observation)
-    ranked = rank_candidates(observation)
-    model_action_id = model_payload.get("chosen_action_id") if model_payload else None
-    model_patient_id = model_payload.get("chosen_patient_id") if model_payload else None
 
-    if model_action_id in {"A1", "A2", "A3"} and isinstance(model_patient_id, int):
-        for _, ranked_action_id, ranked_patient_id in ranked[:3]:
-            if model_action_id == ranked_action_id and model_patient_id == ranked_patient_id:
+    if model_payload is not None:
+        model_action_id = model_payload.get("chosen_action_id")
+        model_patient_id = model_payload.get("chosen_patient_id")
+        if model_action_id in ACTION_ID_TO_TYPE and isinstance(model_patient_id, int):
+            if model_patient_id in eligible.get(model_action_id, []):
                 return SakhaAction(
-                    action_type=ACTION_ID_TO_TYPE[ranked_action_id],
+                    action_type=ACTION_ID_TO_TYPE[model_action_id],
                     patient_id=model_patient_id,
                 )
+            return SakhaAction(action_type=ActionType.NOOP)
 
-    if ranked:
-        _, desired_action_id, desired_patient_id = ranked[0]
-        return SakhaAction(
-            action_type=ACTION_ID_TO_TYPE[desired_action_id],
-            patient_id=desired_patient_id,
-        )
-
-    return build_fallback_action(observation)
+    return priority_policy(observation)
 
 
-def deterministic_policy(obs, step, patient_count):
-    if step % 3 == 0:
-        return SakhaAction(action_type="administer_medicine", patient_id=(step % patient_count) + 1)
-    elif step % 3 == 1:
-        return SakhaAction(action_type="check_vitals", patient_id=(step % patient_count) + 1)
-    else:
-        return SakhaAction(action_type="escalate", patient_id=(step % patient_count) + 1)
+def deterministic_policy(obs, step, patient_count, history: list[str]):
+    action = priority_policy(obs)
+
+    if history:
+        recent = history[-3:]
+        action_key = next((k for k, v in ACTION_ID_TO_TYPE.items() if v == action.action_type), None)
+        if action_key:
+            action_key = f"{action_key}:patient={action.patient_id}"
+            same_count = sum(1 for h in recent if action_key in h)
+
+            if same_count >= 2:
+                ward = obs.ward_state
+                patients = ward.admitted_patients if hasattr(ward, 'admitted_patients') else ward.patients
+                for patient in patients:
+                    pid = getattr(patient, 'patient_id', getattr(patient, 'bed_id', 0))
+                    if pid == action.patient_id:
+                        continue
+                    if action.action_type == ActionType.CHECK_VITALS and getattr(patient, 'vitals_due', False):
+                        return SakhaAction(action_type=ActionType.CHECK_VITALS, patient_id=pid)
+                    if action.action_type == ActionType.ADMINISTER_MEDICINE and getattr(patient, 'medications_due', []):
+                        return SakhaAction(action_type=ActionType.ADMINISTER_MEDICINE, patient_id=pid)
+
+    return action
 
 
 def run_episode(
@@ -317,15 +359,14 @@ def run_episode(
     deterministic_baseline: bool = False,
 ) -> dict:
     started_at = time.perf_counter()
-    patient_count = 5 if task == "easy" else (8 if task == "medium" else 18)
-    env = SakhaEnvironment(patient_count=patient_count, task=task)
+    env = SakhaEnvironment(patient_count=0, task=task)
     obs = env.reset(seed=seed)
     trajectory = [obs]
     history = []
 
     if verbose:
         print(f"\n{'=' * 60}")
-        print(f"Task: {task} | Patients: {patient_count} | Seed: {seed}")
+        print(f"Task: {task} | Seed: {seed}")
         print(f"{'=' * 60}")
 
     for step in range(1, max_steps + 1):
@@ -335,7 +376,7 @@ def run_episode(
             break
 
         if deterministic_baseline:
-            action = deterministic_policy(obs, step, patient_count)
+            action = deterministic_policy(obs, step, 0, history)
         else:
             user_prompt = build_user_prompt(obs, step, history)
             try:
@@ -357,13 +398,21 @@ def run_episode(
         if verbose:
             print(f"  Step {step}: {action.action_type}(patient={action.patient_id})")
 
-        obs = env.step(action)
+        try:
+            obs = env.step(action)
+        except Exception as exc:
+            print(f"  Step {step} failed: {exc}, falling back to noop")
+            obs = env.step(SakhaAction(action_type=ActionType.NOOP))
         trajectory.append(obs)
 
         reward = obs.reward or 0.0
         action_type_value = getattr(action.action_type, "value", action.action_type)
         action_id = next(
-            (key for key, value in ACTION_ID_TO_TYPE.items() if value == action_type_value),
+            (
+                key
+                for key, value in ACTION_ID_TO_TYPE.items()
+                if getattr(value, "value", value) == action_type_value
+            ),
             "UNK",
         )
         history.append(f"{action_id}:patient={action.patient_id}:reward={reward:+.2f}")
@@ -397,14 +446,14 @@ def main() -> None:
     parser.add_argument(
         "--max-steps",
         type=int,
-        default=20,
-        help="Max steps per episode (default: 20 for testing)",
+        default=96,
+        help="Max steps per episode (default: 96 = full 8-hour shift)",
     )
     parser.add_argument("--verbose", action="store_true", help="Print detailed output")
     parser.add_argument(
         "--deterministic-baseline",
         action="store_true",
-        help="Use local heuristic policy instead of LLM for reproducibility",
+        help="Use local ranked-priority policy instead of LLM for reproducibility",
     )
     parser.add_argument(
         "--output-json",
@@ -473,6 +522,8 @@ def main() -> None:
     print("\n=== Full Results ===")
     print(json.dumps(all_results, indent=2))
     if args.output_json:
+        output_path = Path(args.output_json)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
         payload = {
             "tasks": task_summaries,
             "episodes": all_results,
@@ -481,7 +532,7 @@ def main() -> None:
             "seed": args.seed,
             "max_steps": args.max_steps,
         }
-        Path(args.output_json).write_text(json.dumps(payload, indent=2) + "\n")
+        output_path.write_text(json.dumps(payload, indent=2) + "\n")
 
 
 if __name__ == "__main__":
