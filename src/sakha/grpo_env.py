@@ -9,6 +9,7 @@ Wraps SakhaEnv into the format TRL's GRPOTrainer expects:
 import asyncio
 import os
 from typing import Any
+from uuid import uuid4
 
 from sakha.client import SakhaEnv
 from sakha.models import SakhaAction, SakhaObservation
@@ -92,17 +93,20 @@ class SakhaToolEnv:
         self._loop: asyncio.AbstractEventLoop | None = None
         self.reward: float = 0.0
         self._last_obs: SakhaObservation | None = None
-
-    def _get_loop(self):
-        if self._loop is None or self._loop.is_closed():
-            self._loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(self._loop)
-            self._loop.run_until_complete(self._env.connect())
-        return self._loop
+        self._session_id = str(uuid4())
 
     def _run(self, coro):
-        loop = self._get_loop()
-        return loop.run_until_complete(coro)
+        if self._loop is not None and not self._loop.is_closed():
+            try:
+                self._loop.run_until_complete(self._env.close())
+            except Exception:
+                pass
+            self._loop.close()
+        
+        self._loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(self._loop)
+        self._loop.run_until_complete(self._env.connect())
+        return self._loop.run_until_complete(coro)
 
     def reset(self, seed: int | None = None, **kwargs: Any) -> str | None:
         self.reward = 0.0

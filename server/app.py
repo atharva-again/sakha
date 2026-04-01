@@ -3,7 +3,9 @@ from openenv.core.env_server.http_server import create_app
 from sakha.env import SakhaEnvironment
 from sakha.models import SakhaAction, SakhaObservation
 
-app = create_app(SakhaEnvironment, SakhaAction, SakhaObservation, env_name="sakha")
+app = create_app(
+    SakhaEnvironment, SakhaAction, SakhaObservation, env_name="sakha", max_concurrent_envs=5
+)
 
 
 def main():

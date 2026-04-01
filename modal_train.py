@@ -25,7 +25,7 @@ train_image = (
         "uv pip install --system -e /root/sakha",
         env={"PATH": "/root/.local/bin:/usr/local/bin:/usr/bin:/bin:$PATH"},
     )
-    .add_local_dir("/home/verma/projects/sakha/src/sakha", remote_path="/root/sakha/src/sakha")
+    .add_local_dir("/home/verma/projects/sakha/src/sakha", remote_path="/root/sakha/src/sakha", copy=True)
 )
 
 model_vol = modal.Volume.from_name("sakha-models", create_if_missing=True)
