@@ -8,7 +8,6 @@ import modal
 
 app = modal.App("sakha-grpo-training")
 
-# Clean container image — uv for fast, conflict-free installs
 train_image = (
     modal.Image.debian_slim(python_version="3.12")
     .apt_install("git")
@@ -25,10 +24,14 @@ train_image = (
         '"trl>=1.0.0" '
         '"transformers==5.4.0"',
     )
+    .run_commands(
+        "git clone -b grpo-training https://github.com/atharva-again/sakha.git /root/sakha",
+        "uv pip install --system -e /root/sakha",
+    )
 )
 
-# Persistent volume for checkpoints and trained model
 model_vol = modal.Volume.from_name("sakha-models", create_if_missing=True)
+
 
 @app.function(
     image=train_image,
@@ -38,18 +41,27 @@ model_vol = modal.Volume.from_name("sakha-models", create_if_missing=True)
 )
 def train():
     import os
+    import subprocess
     import sys
+    import time
 
     sys.path.insert(0, "/root/sakha/src")
+
+    server_proc = subprocess.Popen(
+        [sys.executable, "/root/sakha/server/app.py"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    time.sleep(5)
+
+    os.environ["SAKHA_ENV_URL"] = "http://localhost:7860"
+    os.environ["TRL_EXPERIMENTAL_SILENCE"] = "1"
 
     from datasets import Dataset
     from trl import GRPOConfig, GRPOTrainer
     from transformers import AutoTokenizer
 
     from sakha.grpo_env import SakhaToolEnv
-
-    os.environ["SAKHA_ENV_URL"] = "http://localhost:7860"
-    os.environ["TRL_EXPERIMENTAL_SILENCE"] = "1"
 
     tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen3.5-4B")
 
