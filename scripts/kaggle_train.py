@@ -12,11 +12,8 @@ Expected runtime: ~1.5-2 hours for 200 steps on P100.
 !git clone -b grpo-training https://github.com/atharva-again/sakha.git /kaggle/working/sakha
 %cd /kaggle/working/sakha
 
-!curl -LsSf https://astral.sh/uv/install.sh | sh
-sys.path.insert(0, "/kaggle/working/sakha/src")
-!uv sync
-!uv pip install "transformers>=5.2.0"
-!uv pip install -e /kaggle/working/sakha
+!pip install --upgrade "transformers>=5.2.0"
+!pip install -e .
 
 # =============================================================================
 # CELL 2: Start the Sakha environment server in background
@@ -51,54 +48,52 @@ from transformers import AutoTokenizer
 
 from sakha.grpo_env import SakhaToolEnv
 
-# Fix: manually set response_schema for Qwen2.5 tokenizer
-# TRL's add_response_schema() doesn't recognize Qwen2.5's chat template
-tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen2.5-0.5B")
-qwen3_5_schema = {
-    "type": "object",
-    "properties": {
-        "name": {"type": "string"},
-        "arguments": {"type": "object"},
-    },
-    "required": ["name", "arguments"],
-}
-tokenizer.response_schema = qwen3_5_schema
+tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen3.5-4B")
 
 # =============================================================================
 # CELL 4: Build training dataset
 # =============================================================================
-easy = (
-    "You are managing a small hospital ward with 5-8 patients. "
-    "Keep patients safe by checking vitals when due, "
-    "administering medications on time, and escalating critical patients. "
-    "Use the available tools to manage the ward effectively. "
-    "Avoid wasting time \u2014 every action counts."
+SYSTEM_PROMPT = (
+    "You are a hospital ward assistant managing patient care. "
+    "Use the available tools to interact with patients. "
+    "Always use the appropriate tool when action is needed. "
+    "Prioritize safety: escalate critical patients immediately, "
+    "administer medications before deadlines, and check vitals on schedule. "
+    "Only act on admitted patients. "
+    "Complete a handover before your shift ends."
 )
-medium = (
-    "You are managing a busy hospital ward with 5-10 patients. "
-    "Patients arrive throughout your shift. Prioritize care: "
-    "check vitals when due, administer medications before deadlines, "
-    "escalate deteriorating patients immediately, and document your actions. "
-    "Complete a handover before your shift ends. "
-    "Avoid wasting time \u2014 every action counts."
-)
-hard = (
-    "You are managing a critical hospital ward with 8-15 patients. "
-    "The ward is understaffed and patients arrive frequently. "
-    "Triage carefully: handle deterioration events within the escalation window, "
-    "administer all medications on time, check vitals on schedule, "
-    "document patient status, and complete a quality handover. "
-    "Missed escalations are safety violations. "
-    "Avoid wasting time \u2014 every action counts."
-)
+
+easy = [
+    {"role": "system", "content": SYSTEM_PROMPT},
+    {"role": "user", "content": "You are managing a small hospital ward with 5 patients. "
+     "Your task: Keep patients safe by administering medications on time and checking vitals when due. "
+     "Complete your shift by ensuring all medications are given and vitals checked."},
+]
+medium = [
+    {"role": "system", "content": SYSTEM_PROMPT},
+    {"role": "user", "content": "You are managing a busy hospital ward with 5-10 patients. "
+     "Patients arrive throughout your shift. Prioritize care: "
+     "check vitals when due, administer medications before deadlines, "
+     "escalate deteriorating patients immediately, and document your actions. "
+     "Complete a handover before your shift ends."},
+]
+hard = [
+    {"role": "system", "content": SYSTEM_PROMPT},
+    {"role": "user", "content": "You are managing a critical hospital ward with 8-15 patients. "
+     "The ward is understaffed and patients arrive frequently. "
+     "Triage carefully: handle deterioration events within the escalation window, "
+     "administer all medications on time, check vitals on schedule, "
+     "document patient status, and complete a quality handover. "
+     "Missed escalations are safety violations."},
+]
 
 prompts = []
 for _ in range(20):
-    prompts.append([{"role": "user", "content": easy}])
+    prompts.append(easy)
 for _ in range(20):
-    prompts.append([{"role": "user", "content": medium}])
+    prompts.append(medium)
 for _ in range(20):
-    prompts.append([{"role": "user", "content": hard}])
+    prompts.append(hard)
 
 dataset = Dataset.from_dict({"prompt": prompts})
 print(f"Dataset size: {len(dataset)} prompts")
