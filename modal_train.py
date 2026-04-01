@@ -49,7 +49,10 @@ def train():
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
     )
-    time.sleep(5)
+    time.sleep(10)
+    stdout, stderr = server_proc.communicate(timeout=1)
+    print(f"DEBUG server stdout: {stdout}")
+    print(f"DEBUG server stderr: {stderr}")
 
     os.environ["SAKHA_ENV_URL"] = "http://localhost:7860"
     os.environ["TRL_EXPERIMENTAL_SILENCE"] = "1"
