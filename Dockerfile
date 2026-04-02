@@ -13,6 +13,7 @@ COPY src/ src/
 COPY server/ server/
 COPY openenv.yaml .
 COPY inference.py .
+COPY README.md .
 
 RUN uv pip install --system -e .
 

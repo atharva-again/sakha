@@ -227,6 +227,8 @@ class SakhaEnvironment(Environment[SakhaAction, SakhaObservation, SakhaState]):
                     if p.escalation_level >= 2:
                         self._escalations += 1
                         p.escalation_level = 0
+                        if action.reason_code:
+                            logger.info(f"Bed {p.bed_id} escalated. Reason: {action.reason_code}")
                     break
 
     def _check_missed_escalations(self) -> None:
