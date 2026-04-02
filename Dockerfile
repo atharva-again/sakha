@@ -4,6 +4,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends git && rm -rf /
 
 WORKDIR /app
 
+ENV ENABLE_WEB_INTERFACE=true
+
 RUN pip install --no-cache-dir uv
 
 COPY pyproject.toml .
