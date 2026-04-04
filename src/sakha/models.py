@@ -87,6 +87,13 @@ class SakhaEpisodeMetrics(BaseModel):
     deteriorations_handled: int = 0
 
 
+class ActionResult(BaseModel):
+    """Feedback about what the last action did."""
+
+    status: str  # "success" | "invalid" | "no_effect"
+    detail: str = ""
+
+
 class SakhaObservation(Observation):
     """
     Policy-visible observation for the Sakha environment.
@@ -99,6 +106,7 @@ class SakhaObservation(Observation):
     ward_state: WardState = Field(default_factory=WardState)
     pending_count: int = 0
     time_remaining_minutes: int = 480
+    action_result: ActionResult | None = None
 
     @field_validator("ward_state", mode="before")
     @classmethod

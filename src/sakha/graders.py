@@ -36,31 +36,26 @@ def _count_final_metrics(trajectory: list[SakhaObservation]) -> SakhaEpisodeMetr
         if initial_p.vitals_due and not final_p.vitals_due:
             vitals += 1
 
-    # Calculate escalations (when escalation level goes from >=2 to 0)
+    # Calculate escalations: patient ever reached >=2 during trajectory and ended at 0
+    # Scan full trajectory to catch runtime deteriorations, not just initial state
+    ever_deteriorated: dict[int, bool] = {}
+    for obs in trajectory:
+        for p in obs.ward_state.patients:
+            if p.escalation_level >= 2:
+                ever_deteriorated[p.bed_id] = True
+
     escalations = sum(
         1
         for p in final_patients
-        if p.escalation_level == 0
-        and any(orig.escalation_level >= 2 for orig in initial_patients if orig.bed_id == p.bed_id)
+        if p.escalation_level == 0 and ever_deteriorated.get(p.bed_id, False)
     )
 
-    # Calculate missed escalations: count patients who had escalation_level >= 2 at any point but never got escalated
-    # We need to check if any patient ever had escalation_level >= 2 but final escalation_level >= 2 (meaning never resolved)
-    for i, initial_p in enumerate(initial_patients):
-        final_p = final_patients[i] if i < len(final_patients) else initial_p
-        # Check if patient ever had escalation >= 2 during the trajectory
-        ever_had_escalation = False
-        for obs in trajectory:
-            patient_in_obs = next(
-                (p for p in obs.ward_state.patients if p.bed_id == initial_p.bed_id),
-                None,
-            )
-            if patient_in_obs and patient_in_obs.escalation_level >= 2:
-                ever_had_escalation = True
-                break
-        # If they ever had escalation >= 2 but still have it >= 2 at end, it was missed
-        if ever_had_escalation and final_p.escalation_level >= 2:
-            missed_escalations += 1
+    # Calculate missed escalations: ever deteriorated AND still >= 2 at end
+    missed_escalations = sum(
+        1
+        for p in final_patients
+        if ever_deteriorated.get(p.bed_id, False) and p.escalation_level >= 2
+    )
 
     # Calculate conflicts resolved: medicine given to patient with escalation_level > 0
     # We need to check each step for medicine administration to patients with escalation > 0

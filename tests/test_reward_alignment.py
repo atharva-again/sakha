@@ -10,12 +10,12 @@ def test_reward_on_time_medication():
     assert obs.reward > 0.0
 
 
-def test_reward_noop_penalizes_inaction():
+def test_reward_noop_is_neutral():
     env = SakhaEnvironment(patient_count=5)
     obs = env.reset(seed=42)
     obs = env.step(SakhaAction(action_type="noop", patient_id=None))
     assert obs.reward is not None
-    assert obs.reward < 0.0
+    assert obs.reward == 0.0
 
 
 def test_reward_aligns_with_grader():
