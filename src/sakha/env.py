@@ -5,6 +5,7 @@ from uuid import uuid4
 from openenv.core.env_server.interfaces import Environment
 
 from sakha.models import (
+    ActionResult,
     ActionType,
     PatientState,
     SakhaAction,
@@ -76,9 +77,11 @@ class SakhaEnvironment(Environment[SakhaAction, SakhaObservation, SakhaState]):
         self._missed_escalations = 0
         self._conflicts_resolved = 0
         self._deteriorations_handled = 0
-        self._missed_escalation_patients: set[int] = set()
+        self._ever_deteriorated_patients: set[int] = set()
         self._episode_metrics = SakhaEpisodeMetrics()
         self._deterioration_steps: list[int] = []
+        self._total_patients: int = 0
+        self._prev_potential: float = 0.0
 
     def reset(
         self, seed: int | None = None, episode_id: str | None = None, **kwargs
@@ -106,7 +109,9 @@ class SakhaEnvironment(Environment[SakhaAction, SakhaObservation, SakhaState]):
         self._missed_escalations = 0
         self._conflicts_resolved = 0
         self._deteriorations_handled = 0
-        self._missed_escalation_patients = set()
+        self._ever_deteriorated_patients = set()
+        self._total_patients = len(self._ward.patients)
+        self._prev_potential = self._compute_potential()
 
         self._episode_metrics = SakhaEpisodeMetrics(
             episode_id=eid,
@@ -128,42 +133,16 @@ class SakhaEnvironment(Environment[SakhaAction, SakhaObservation, SakhaState]):
         self._ward.current_time_minutes += 5
         self._state.current_time = self._ward.current_time_minutes
 
-        prev_meds = self._meds_administered
-        prev_vitals = self._vitals_checked
-        prev_escalations = self._escalations
-        prev_missed = self._missed_escalations
-
         self._trigger_events()
-        self._process_action(action)
+        action_result = self._process_action(action)
         self._check_missed_escalations()
-
-        delta_meds = self._meds_administered - prev_meds
-        delta_vitals = self._vitals_checked - prev_vitals
-        delta_escalations = self._escalations - prev_escalations
-        delta_missed = self._missed_escalations - prev_missed
-
-        step_reward = 0.0
-        step_reward += delta_meds * 0.1
-        step_reward += delta_vitals * 0.05
-        step_reward += delta_escalations * 0.15
-
-        step_reward -= delta_missed * 0.05
-
-        action_processed = delta_meds > 0 or delta_vitals > 0 or delta_escalations > 0
-
-        if action.action_type == ActionType.NOOP or not action_processed:
-            step_reward = -0.05
 
         done = self._ward.current_time_minutes >= START_TIME_MINUTES + EIGHT_HOURS_MINUTES
         truncated = False
 
-        self._episode_metrics.step = self._state.step_count
-        self._episode_metrics.meds_administered = self._meds_administered
-        self._episode_metrics.vitals_checked = self._vitals_checked
-        self._episode_metrics.escalations = self._escalations
-        self._episode_metrics.missed_escalations = self._missed_escalations
-        self._episode_metrics.conflicts_resolved = self._conflicts_resolved
-        self._episode_metrics.deteriorations_handled = self._deteriorations_handled
+        current_potential = self._compute_potential()
+        step_reward = current_potential - self._prev_potential
+        self._prev_potential = current_potential
 
         logger.debug(
             f"Step {self._state.step_count}: action={action.action_type}, reward={step_reward:.3f}, "
@@ -171,7 +150,9 @@ class SakhaEnvironment(Environment[SakhaAction, SakhaObservation, SakhaState]):
             f"escalations={self._escalations}, missed={self._missed_escalations}"
         )
 
-        return self._build_observation(done=done, truncated=truncated, reward=step_reward)
+        return self._build_observation(
+            done=done, truncated=truncated, reward=step_reward, action_result=action_result
+        )
 
     def _trigger_events(self) -> None:
         if self._deterioration_steps and self._state.step_count in self._deterioration_steps:
@@ -193,17 +174,12 @@ class SakhaEnvironment(Environment[SakhaAction, SakhaObservation, SakhaState]):
             return False
         return 1 <= patient_id <= self._patient_count
 
-    def _process_action(self, action: SakhaAction) -> None:
+    def _process_action(self, action: SakhaAction) -> ActionResult:
         if action.action_type == ActionType.NOOP:
-            return
+            return ActionResult(status="no_effect", detail="No operation")
 
-        invalid_action = False
         if action.patient_id is not None and not self._validate_patient_id(action.patient_id):
-            logger.warning(f"Invalid patient_id {action.patient_id} - ignoring action")
-            invalid_action = True
-
-        if invalid_action:
-            return
+            return ActionResult(status="invalid", detail=f"Invalid patient_id {action.patient_id}")
 
         if action.action_type == ActionType.ADMINISTER_MEDICINE and action.patient_id is not None:
             for p in self._ward.patients:
@@ -212,16 +188,33 @@ class SakhaEnvironment(Environment[SakhaAction, SakhaObservation, SakhaState]):
                     self._meds_administered += 1
                     if p.escalation_level > 0:
                         self._conflicts_resolved += 1
-                    break
-        elif action.action_type == ActionType.CHECK_VITALS and action.patient_id is not None:
+                    return ActionResult(
+                        status="success",
+                        detail=f"Medicine administered to patient {p.bed_id}",
+                    )
+            return ActionResult(
+                status="no_effect",
+                detail=f"No medications due for patient {action.patient_id}",
+            )
+
+        if action.action_type == ActionType.CHECK_VITALS and action.patient_id is not None:
             for p in self._ward.patients:
                 if p.bed_id == action.patient_id:
-                    p.vitals_due = False
-                    self._vitals_checked += 1
-                    if p.escalation_level >= 2:
-                        self._deteriorations_handled += 1
-                    break
-        elif action.action_type == ActionType.ESCALATE and action.patient_id is not None:
+                    if p.vitals_due:
+                        p.vitals_due = False
+                        self._vitals_checked += 1
+                        if p.escalation_level >= 2:
+                            self._deteriorations_handled += 1
+                        return ActionResult(
+                            status="success",
+                            detail=f"Vitals checked for patient {p.bed_id}",
+                        )
+                    return ActionResult(
+                        status="no_effect",
+                        detail=f"No vitals due for patient {p.bed_id}",
+                    )
+
+        if action.action_type == ActionType.ESCALATE and action.patient_id is not None:
             for p in self._ward.patients:
                 if p.bed_id == action.patient_id:
                     if p.escalation_level >= 2:
@@ -229,13 +222,38 @@ class SakhaEnvironment(Environment[SakhaAction, SakhaObservation, SakhaState]):
                         p.escalation_level = 0
                         if action.reason_code:
                             logger.info(f"Bed {p.bed_id} escalated. Reason: {action.reason_code}")
-                    break
+                        return ActionResult(
+                            status="success",
+                            detail=f"Patient {p.bed_id} escalated",
+                        )
+                    return ActionResult(
+                        status="no_effect",
+                        detail=f"Patient {p.bed_id} not critical (level={p.escalation_level})",
+                    )
+
+        return ActionResult(status="invalid", detail=f"Unknown action {action.action_type}")
 
     def _check_missed_escalations(self) -> None:
         for p in self._ward.patients:
-            if p.escalation_level >= 2 and p.bed_id not in self._missed_escalation_patients:
-                self._missed_escalation_patients.add(p.bed_id)
-                self._missed_escalations += 1
+            if p.escalation_level >= 2:
+                self._ever_deteriorated_patients.add(p.bed_id)
+        self._missed_escalations = sum(
+            1
+            for p in self._ward.patients
+            if p.bed_id in self._ever_deteriorated_patients and p.escalation_level >= 2
+        )
+
+    def _compute_potential(self) -> float:
+        tp = self._total_patients
+        denom_escalations = max(1, tp // 4)
+        denom_deteriorations = max(1, tp // 3)
+        return (
+            0.3 * min(1.0, self._meds_administered / max(1, tp))
+            + 0.2 * min(1.0, self._vitals_checked / max(1, tp))
+            + 0.25 * min(1.0, self._escalations / denom_escalations)
+            + 0.25 * min(1.0, self._deteriorations_handled / denom_deteriorations)
+            - self._missed_escalations * 0.05
+        )
 
     @property
     def state(self) -> SakhaState:
@@ -246,7 +264,11 @@ class SakhaEnvironment(Environment[SakhaAction, SakhaObservation, SakhaState]):
         return self._episode_metrics
 
     def _build_observation(
-        self, done: bool, reward: float | None, truncated: bool = False
+        self,
+        done: bool,
+        reward: float | None,
+        truncated: bool = False,
+        action_result: ActionResult | None = None,
     ) -> SakhaObservation:
         pending = sum(1 for p in self._ward.patients if p.medications_due or p.vitals_due)
         time_remaining = (
@@ -258,4 +280,5 @@ class SakhaEnvironment(Environment[SakhaAction, SakhaObservation, SakhaState]):
             ward_state=self._ward.model_copy(deep=True),
             pending_count=pending,
             time_remaining_minutes=max(0, time_remaining),
+            action_result=action_result,
         )

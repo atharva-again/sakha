@@ -14,11 +14,12 @@ Usage:
     python inference.py --tasks easy,medium,hard --seed 42 --episodes 3
 """
 
-import os
-import sys
-import json
-import re
 import argparse
+import json
+import logging
+import os
+import re
+import sys
 import textwrap
 import time
 from pathlib import Path
@@ -27,12 +28,23 @@ from dotenv import load_dotenv
 from openai import OpenAI
 from tenacity import (
     retry,
+    retry_if_exception_type,
     stop_after_attempt,
     wait_exponential,
-    retry_if_exception_type,
 )
 
+from sakha.env import SakhaEnvironment
+from sakha.graders import score_easy_task, score_hard_task, score_medium_task
+from sakha.models import SakhaAction, SakhaObservation
+
 load_dotenv()
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[logging.StreamHandler(sys.stdout)],
+)
+logger = logging.getLogger("sakha")
 
 
 @retry(
@@ -56,11 +68,6 @@ def call_llm_with_retry(client, messages):
         raise
 
 
-from sakha.env import SakhaEnvironment
-from sakha.models import SakhaAction, SakhaObservation
-from sakha.graders import score_easy_task, score_medium_task, score_hard_task
-
-
 API_BASE_URL = os.getenv("API_BASE_URL", "https://router.huggingface.co/v1")
 API_KEY = os.getenv("HF_TOKEN") or os.getenv("API_KEY") or os.getenv("OPENAI_API_KEY")
 MODEL_NAME = os.getenv("MODEL_NAME", "microsoft/Phi-3-mini-4k-instruct")
@@ -82,111 +89,76 @@ TASK_GRADERS = {
 }
 
 
+def build_user_prompt(
+    observation: SakhaObservation,
+    step: int,
+    history: list[str],
+    scratchpad: str | None = None,
+) -> str:
+    ward = observation.ward_state
+
+    state_payload = {
+        "step": step,
+        "time_remaining_minutes": observation.time_remaining_minutes,
+        "pending_count": observation.pending_count,
+        "patients": [p.model_dump() for p in ward.patients],
+        "recent_actions": history[-3:] if history else [],
+    }
+
+    prompt_parts = [
+        "STATE JSON:",
+        json.dumps(state_payload, separators=(",", ":")),
+    ]
+
+    if observation.action_result:
+        prompt_parts.append(
+            f"ACTION RESULT: {observation.action_result.status} — {observation.action_result.detail}"
+        )
+
+    if scratchpad:
+        prompt_parts.append(f"YOUR PREVIOUS NOTES: {scratchpad}")
+
+    prompt_parts.append("Produce the required JSON decision now.")
+
+    return textwrap.dedent("\n".join(prompt_parts)).strip()
+
+
 SYSTEM_PROMPT = textwrap.dedent(
     """
     You are a hospital ward assistant AI managing patient care.
 
-    Your task is to select one action from a fixed policy table using only the current state.
+    Your task is to analyze the current ward state and select the most appropriate action based on the ABCDE clinical priority protocol.
+
+    ABCDE PRIORITIES:
+    1. A/B/C (Critical): escalation_level >= 2. Action: check_vitals (to document deterioration) then escalate.
+    2. D (Potential): elevated status or abnormal vitals. Action: check_vitals.
+    3. E (Routine): medications due. Action: administer_medicine.
 
     ACTION IDS:
     - A1 = administer_medicine(patient_id)
     - A2 = check_vitals(patient_id)
     - A3 = escalate(patient_id)
 
-    POLICY TABLE:
-    - A1 trigger: patient_id is in meds_due_patients
-      blocker: patient_id not in meds_due_patients
-      evidence needed: meds_due_patients contains patient_id
-    - A2 trigger: patient_id is in vitals_due_patients
-      blocker: patient_id not in vitals_due_patients
-      evidence needed: vitals_due_patients contains patient_id
-    - A3 trigger: patient_id is in critical_patients
-      blocker: patient_id not in critical_patients
-      evidence needed: critical_patients contains patient_id
-
-    DECISION RULES:
-    1. Read the state first.
-    2. Mark actions eligible only when their trigger is satisfied.
-    3. Do not choose an ineligible action.
-    4. If multiple actions are eligible, prefer the highest-priority action for the current state:
-       critical_patients first, then meds_due_patients, then vitals_due_patients.
-    5. If the same action_id appears repeatedly in recent_action_ids while other eligible action_ids exist, pick a different eligible action.
-    6. Choose using patient ids from the state, not habit.
-
     REQUIRED OUTPUT FORMAT:
-    Return exactly one JSON object with this shape:
-    {
-      "eligible_actions": [
-        {"id": "A1", "patient_id": 1, "eligible": true},
-        {"id": "A2", "patient_id": 1, "eligible": true},
-        {"id": "A3", "patient_id": 1, "eligible": false}
-      ],
-      "chosen_action_id": "A1",
-      "chosen_patient_id": 1
-    }
+    You must provide your reasoning followed by the JSON action in a fenced code block.
 
-    Return JSON only.
+    Example:
+    Reasoning: Patient 4 has an escalation level of 2 and vitals are due. I will check vitals first to document the deterioration before escalating.
+    ```json
+    {
+      "chosen_action_id": "A2",
+      "chosen_patient_id": 4,
+      "scratchpad": "P3 temp 39.5 → escalated. P7 needs vitals next."
+    }
+    ```
+
+    The "scratchpad" field is optional — use it to track your notes across steps.
+    Only one JSON block is allowed.
     """
 ).strip()
 
-
-def build_user_prompt(observation: SakhaObservation, step: int, history: list[str]) -> str:
-    ward = observation.ward_state
-
-    critical_patients = []
-    meds_due_patients = []
-    vitals_due_patients = []
-    elevated_patients = []
-    abnormal_vitals_patients = []
-
-    for p in ward.patients:
-        if p.escalation_level >= 2:
-            critical_patients.append(p.bed_id)
-        elif p.escalation_level == 1:
-            elevated_patients.append(p.bed_id)
-
-        if p.medications_due:
-            meds_due_patients.append({"patient_id": p.bed_id, "count": len(p.medications_due)})
-
-        if p.vitals_due:
-            vitals_due_patients.append(p.bed_id)
-
-        if p.last_vitals:
-            v = p.last_vitals
-            if v.temperature >= 39.0 or v.spo2 < 93 or v.pulse >= 100:
-                abnormal_vitals_patients.append(
-                    {
-                        "patient_id": p.bed_id,
-                        "temp": v.temperature,
-                        "spo2": v.spo2,
-                        "pulse": v.pulse,
-                    }
-                )
-
-    recent_action_ids = [item.split(":", 1)[0] for item in history[-3:]] if history else []
-
-    state_payload = {
-        "step": step,
-        "time_remaining_minutes": observation.time_remaining_minutes,
-        "pending_count": observation.pending_count,
-        "critical_patients": critical_patients,
-        "elevated_patients": elevated_patients,
-        "meds_due_patients": meds_due_patients,
-        "vitals_due_patients": vitals_due_patients,
-        "abnormal_vitals_patients": abnormal_vitals_patients,
-        "recent_action_ids": recent_action_ids,
-    }
-
-    return textwrap.dedent(
-        f"""
-        STATE JSON:
-        {json.dumps(state_payload, separators=(",", ":"))}
-
-        Produce the required JSON decision now."""
-    ).strip()
-
-
-JSON_BLOCK_PATTERN = re.compile(r"\{.*\}", re.DOTALL)
+FENCED_JSON_PATTERN = re.compile(r"```(?:json)?\s*(\{.*?\})\s*```", re.DOTALL)
+FALLBACK_JSON_PATTERN = re.compile(r"(\{.*\})", re.DOTALL)
 
 
 def build_fallback_action(observation: SakhaObservation) -> SakhaAction:
@@ -207,19 +179,21 @@ def extract_model_decision(response_text: str) -> dict | None:
         return None
 
     text = response_text.strip()
-    text = re.sub(r"```python\s*", "", text)
-    text = re.sub(r"```json\s*", "", text)
-    text = re.sub(r"```\s*", "", text)
-    text = re.sub(r"^(action|next action|response)\s*[:\-]\s*", "", text, flags=re.IGNORECASE)
+    match = FENCED_JSON_PATTERN.search(text)
+    if match:
+        try:
+            return json.loads(match.group(1))
+        except json.JSONDecodeError:
+            pass
 
-    match = JSON_BLOCK_PATTERN.search(text)
-    if not match:
-        return None
+    match_fallback = FALLBACK_JSON_PATTERN.search(text)
+    if match_fallback:
+        try:
+            return json.loads(match_fallback.group(1))
+        except json.JSONDecodeError:
+            pass
 
-    try:
-        return json.loads(match.group(0))
-    except json.JSONDecodeError:
-        return None
+    return None
 
 
 def get_patient(observation: SakhaObservation, patient_id: int):
@@ -253,66 +227,66 @@ def rank_candidates(observation: SakhaObservation) -> list[tuple[int, str, int]]
         abnormal = has_abnormal_vitals(patient)
 
         if patient.escalation_level >= 2:
-            ranked.append((1000 + patient.escalation_level, "A3", bed_id))
+            if patient.vitals_due:
+                ranked.append((2000, "A2", bed_id))
+                ranked.append((1500, "A3", bed_id))
+            else:
+                ranked.append((2500, "A3", bed_id))
 
-        if patient.vitals_due:
-            vitals_score = 400
-            if elevated:
-                vitals_score += 120
+        elif patient.vitals_due:
+            vitals_score = 800
             if abnormal:
-                vitals_score += 100
+                vitals_score += 400
+            if elevated:
+                vitals_score += 200
             ranked.append((vitals_score, "A2", bed_id))
 
         if patient.medications_due:
-            meds_score = 300 + len(patient.medications_due) * 10
+            meds_score = 600 + len(patient.medications_due) * 20
             if elevated:
-                meds_score += 40
+                meds_score += 100
             ranked.append((meds_score, "A1", bed_id))
 
     ranked.sort(key=lambda item: (-item[0], item[2], item[1]))
     return ranked
 
 
-def choose_balanced_action(
-    observation: SakhaObservation, history: list[str], model_payload: dict | None
-) -> SakhaAction:
-    eligible = get_eligible_candidates(observation)
-    ranked = rank_candidates(observation)
-    model_action_id = model_payload.get("chosen_action_id") if model_payload else None
-    model_patient_id = model_payload.get("chosen_patient_id") if model_payload else None
+def select_action(
+    observation: SakhaObservation, model_payload: dict | None
+) -> tuple[SakhaAction, str | None]:
+    if model_payload is None:
+        return build_fallback_action(observation), None
 
-    if model_action_id in {"A1", "A2", "A3"} and isinstance(model_patient_id, int):
-        for _, ranked_action_id, ranked_patient_id in ranked[:3]:
-            if model_action_id == ranked_action_id and model_patient_id == ranked_patient_id:
-                return SakhaAction(
-                    action_type=ACTION_ID_TO_TYPE[ranked_action_id],
-                    patient_id=model_patient_id,
-                )
+    scratchpad = model_payload.get("scratchpad")
+    if not isinstance(scratchpad, str):
+        scratchpad = None
 
-    if ranked:
-        _, desired_action_id, desired_patient_id = ranked[0]
-        return SakhaAction(
-            action_type=ACTION_ID_TO_TYPE[desired_action_id],
-            patient_id=desired_patient_id,
+    try:
+        action = SakhaAction(
+            action_type=ACTION_ID_TO_TYPE[model_payload["chosen_action_id"]],
+            patient_id=model_payload["chosen_patient_id"],
         )
+        return action, scratchpad
+    except (ValueError, KeyError, TypeError):
+        return build_fallback_action(observation), scratchpad
 
-    return build_fallback_action(observation)
 
-
-def deterministic_policy(obs, step, patient_count):
-    if step % 3 == 0:
-        return SakhaAction(action_type="administer_medicine", patient_id=(step % patient_count) + 1)
-    elif step % 3 == 1:
-        return SakhaAction(action_type="check_vitals", patient_id=(step % patient_count) + 1)
-    else:
-        return SakhaAction(action_type="escalate", patient_id=(step % patient_count) + 1)
+def deterministic_policy(obs: SakhaObservation, step: int, patient_count: int) -> SakhaAction:
+    ranked = rank_candidates(obs)
+    if ranked:
+        _, action_id, patient_id = ranked[0]
+        return SakhaAction(
+            action_type=ACTION_ID_TO_TYPE[action_id],
+            patient_id=patient_id,
+        )
+    return SakhaAction(action_type="noop", patient_id=None)
 
 
 def run_episode(
     client,
     task: str,
     seed: int,
-    max_steps: int = 20,
+    max_steps: int = 96,
     verbose: bool = False,
     deterministic_baseline: bool = False,
 ) -> dict:
@@ -321,7 +295,8 @@ def run_episode(
     env = SakhaEnvironment(patient_count=patient_count, task=task)
     obs = env.reset(seed=seed)
     trajectory = [obs]
-    history = []
+    history: list[str] = []
+    scratchpad: str | None = None
 
     if verbose:
         print(f"\n{'=' * 60}")
@@ -329,15 +304,10 @@ def run_episode(
         print(f"{'=' * 60}")
 
     for step in range(1, max_steps + 1):
-        if obs.done:
-            if verbose:
-                print(f"Episode complete at step {step - 1}")
-            break
-
         if deterministic_baseline:
             action = deterministic_policy(obs, step, patient_count)
         else:
-            user_prompt = build_user_prompt(obs, step, history)
+            user_prompt = build_user_prompt(obs, step, history, scratchpad)
             try:
                 completion = call_llm_with_retry(
                     client,
@@ -352,7 +322,7 @@ def run_episode(
                     print(f"  LLM error: {exc}")
                 response_text = ""
             model_payload = extract_model_decision(response_text)
-            action = choose_balanced_action(obs, history, model_payload)
+            action, scratchpad = select_action(obs, model_payload)
 
         if verbose:
             print(f"  Step {step}: {action.action_type}(patient={action.patient_id})")
@@ -366,25 +336,28 @@ def run_episode(
             (key for key, value in ACTION_ID_TO_TYPE.items() if value == action_type_value),
             "UNK",
         )
-        history.append(f"{action_id}:patient={action.patient_id}:reward={reward:+.2f}")
+
+        if obs.action_result:
+            history_entry = f"{action_id}(patient={action.patient_id}) → {obs.action_result.detail}"
+        else:
+            history_entry = f"{action_id}(patient={action.patient_id}):reward={reward:+.2f}"
+        history.append(history_entry)
 
     grader = TASK_GRADERS[task]
     score = grader(trajectory)
-    cumulative_reward = sum(o.reward for o in trajectory if o.reward is not None)
 
     result = {
         "task": task,
         "seed": seed,
         "steps": len(trajectory) - 1,
         "grader_score": score,
-        "cumulative_reward": round(cumulative_reward, 4),
         "done": trajectory[-1].done,
         "runtime_seconds": round(time.perf_counter() - started_at, 4),
         "mode": "deterministic" if deterministic_baseline else "llm",
     }
 
     if verbose:
-        print(f"  Score: {score:.4f} | Reward: {cumulative_reward:.4f}")
+        print(f"  Score: {score:.4f}")
 
     return result
 
@@ -397,8 +370,8 @@ def main() -> None:
     parser.add_argument(
         "--max-steps",
         type=int,
-        default=20,
-        help="Max steps per episode (default: 20 for testing)",
+        default=96,
+        help="Max steps per episode (default: 96 for full 8-hour shift)",
     )
     parser.add_argument("--verbose", action="store_true", help="Print detailed output")
     parser.add_argument(
@@ -435,7 +408,6 @@ def main() -> None:
 
     for task in tasks:
         task_scores = []
-        task_rewards = []
 
         for ep in range(args.episodes):
             seed = args.seed + ep
@@ -449,23 +421,18 @@ def main() -> None:
             )
             all_results.append(result)
             task_scores.append(result["grader_score"])
-            task_rewards.append(result["cumulative_reward"])
 
         avg_score = sum(task_scores) / len(task_scores)
-        avg_reward = sum(task_rewards) / len(task_rewards)
         task_runtime = round(
             sum(result["runtime_seconds"] for result in all_results if result["task"] == task),
             4,
         )
-        print(
-            f"[{task}] avg_score={avg_score:.4f} avg_reward={avg_reward:.4f} (over {args.episodes} episodes)"
-        )
+        print(f"[{task}] avg_score={avg_score:.4f} (over {args.episodes} episodes)")
         task_summaries.append(
             {
                 "task": task,
                 "episodes": args.episodes,
                 "avg_score": round(avg_score, 4),
-                "avg_reward": round(avg_reward, 4),
                 "runtime_seconds": task_runtime,
             }
         )

@@ -18,27 +18,30 @@ def test_valid_action_type_accepted():
     assert action.action_type == ActionType.ADMINISTER_MEDICINE
 
 
-def test_invalid_patient_id_logs_warning(caplog):
+def test_invalid_patient_id_returns_action_result():
     env = SakhaEnvironment(patient_count=5)
     env.reset(seed=42)
     obs = env.step(SakhaAction(action_type=ActionType.ADMINISTER_MEDICINE, patient_id=999))
-    assert "Invalid patient_id" in caplog.text
+    assert obs.action_result is not None
+    assert obs.action_result.status == "invalid"
 
 
-def test_noop_penalty_is_negative():
+def test_noop_is_neutral():
     env = SakhaEnvironment(patient_count=5)
     obs = env.reset(seed=42)
     obs = env.step(SakhaAction(action_type=ActionType.NOOP))
-    assert obs.reward is not None
-    assert obs.reward < 0.0
-    assert obs.reward == -0.05
+    assert obs.reward == 0.0
+    assert obs.action_result is not None
+    assert obs.action_result.status == "no_effect"
 
 
-def test_out_of_range_patient_id_handled():
+def test_out_of_range_patient_id_no_penalty():
     env = SakhaEnvironment(patient_count=5)
     env.reset(seed=42)
     obs = env.step(SakhaAction(action_type=ActionType.CHECK_VITALS, patient_id=100))
-    assert obs.reward == -0.05
+    assert obs.reward == 0.0
+    assert obs.action_result is not None
+    assert obs.action_result.status == "invalid"
 
 
 def test_action_validation_with_enum():
