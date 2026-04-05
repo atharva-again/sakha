@@ -1,7 +1,8 @@
-import json
 import hashlib
+import json
+
 from sakha.env import SakhaEnvironment
-from sakha.models import SakhaAction
+from sakha.models import ActionType, SakhaAction
 
 
 def test_deterministic_trajectory():
@@ -9,8 +10,8 @@ def test_deterministic_trajectory():
         env = SakhaEnvironment()
         obs = env.reset(seed=seed)
         log = [obs.model_dump(mode="json")]
-        for i in range(5):
-            action = SakhaAction(action_type="noop", patient_id=None)
+        for _ in range(5):
+            action = SakhaAction(action_type=ActionType.NOOP, patient_id=None)
             obs = env.step(action)
             log.append(obs.model_dump(mode="json"))
         return hashlib.sha256(json.dumps(log, sort_keys=True).encode()).hexdigest()

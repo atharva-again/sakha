@@ -1,10 +1,10 @@
-from openenv.core.env_server.types import Action, Observation, State
+from openenv.core.env_server.types import Observation, State
 
 
 def test_sakha_action_has_required_fields():
-    from sakha.models import SakhaAction
+    from sakha.models import ActionType, SakhaAction
 
-    action = SakhaAction(action_type="noop", patient_id=None)
+    action = SakhaAction(action_type=ActionType.NOOP, patient_id=None)
     assert hasattr(action, "action_type")
     assert hasattr(action, "patient_id")
 
@@ -50,11 +50,11 @@ def test_env_reset_returns_observation():
 
 def test_env_step_returns_observation():
     from sakha.env import SakhaEnvironment
-    from sakha.models import SakhaAction, SakhaObservation
+    from sakha.models import ActionType, SakhaAction, SakhaObservation
 
     env = SakhaEnvironment()
     env.reset(seed=42)
-    action = SakhaAction(action_type="noop", patient_id=None)
+    action = SakhaAction(action_type=ActionType.NOOP, patient_id=None)
     obs = env.step(action)
     assert isinstance(obs, SakhaObservation)
 
