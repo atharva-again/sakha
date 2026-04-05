@@ -1,6 +1,3 @@
-import pytest
-
-
 def test_import_sakha():
     import sakha
 

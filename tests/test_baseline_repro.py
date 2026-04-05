@@ -24,6 +24,6 @@ def run_inference() -> str:
 def test_baseline_reproducibility():
     out1 = run_inference()
     out2 = run_inference()
-    lines1 = [l for l in out1.splitlines() if l.startswith("[")]
-    lines2 = [l for l in out2.splitlines() if l.startswith("[")]
+    lines1 = [line for line in out1.splitlines() if line.startswith("[")]
+    lines2 = [line for line in out2.splitlines() if line.startswith("[")]
     assert lines1 == lines2, "Baseline must produce identical outputs across runs"
