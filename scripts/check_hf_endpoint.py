@@ -1,6 +1,6 @@
-import sys
 import argparse
 import json
+import sys
 
 try:
     import httpx
