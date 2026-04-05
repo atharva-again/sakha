@@ -1,154 +1,128 @@
-from sakha.models import SakhaEpisodeMetrics, SakhaObservation
+from sakha.models import PatientState, SakhaObservation
 
 
-def _compute_med_score(meds_administered: int, total_patients: int) -> float:
-    return min(1.0, meds_administered / max(1, total_patients))
-
-
-def _compute_vitals_score(vitals_checked: int, total_patients: int) -> float:
-    return min(1.0, vitals_checked / max(1, total_patients))
-
-
-def _count_final_metrics(trajectory: list[SakhaObservation]) -> SakhaEpisodeMetrics:
+def _final_patients(trajectory: list[SakhaObservation]) -> list[PatientState]:
     if not trajectory:
-        return SakhaEpisodeMetrics()
+        return []
+    return trajectory[-1].ward_state.patients
 
-    final_obs = trajectory[-1]
-    initial_patients = trajectory[0].ward_state.patients
-    final_patients = final_obs.ward_state.patients
 
-    meds = 0
-    vitals = 0
-    escalations = 0
-    missed_escalations = 0
-    conflicts_resolved = 0
-    deteriorations_handled = 0
+def _sum_metric(patients: list[PatientState], field_name: str) -> int:
+    return sum(getattr(patient, field_name) for patient in patients)
 
-    # Calculate medication administration and vitals checks
-    for i, initial_p in enumerate(initial_patients):
-        final_p = final_patients[i] if i < len(final_patients) else initial_p
-        initial_meds = len(initial_p.medications_due)
-        final_meds = len(final_p.medications_due)
-        if final_meds < initial_meds:
-            meds += initial_meds - final_meds
-        if not initial_p.vitals_due and final_p.vitals_due:
-            continue
-        if initial_p.vitals_due and not final_p.vitals_due:
-            vitals += 1
 
-    # Calculate escalations: patient ever reached >=2 during trajectory and ended at 0
-    # Scan full trajectory to catch runtime deteriorations, not just initial state
-    ever_deteriorated: dict[int, bool] = {}
-    for obs in trajectory:
-        for p in obs.ward_state.patients:
-            if p.escalation_level >= 2:
-                ever_deteriorated[p.bed_id] = True
+def _ratio(numerator: int, denominator: int) -> float:
+    return min(1.0, numerator / max(1, denominator))
 
-    escalations = sum(
+
+def _action_quality(trajectory: list[SakhaObservation]) -> float:
+    if len(trajectory) <= 1:
+        return 0.0
+    total_steps = len(trajectory) - 1
+    productive = sum(
         1
-        for p in final_patients
-        if p.escalation_level == 0 and ever_deteriorated.get(p.bed_id, False)
+        for observation in trajectory[1:]
+        if observation.action_result is not None and observation.action_result.status == "success"
     )
-
-    # Calculate missed escalations: ever deteriorated AND still >= 2 at end
-    missed_escalations = sum(
-        1
-        for p in final_patients
-        if ever_deteriorated.get(p.bed_id, False) and p.escalation_level >= 2
-    )
-
-    # Calculate conflicts resolved: medicine given to patient with escalation_level > 0
-    # We need to check each step for medicine administration to patients with escalation > 0
-    for step_idx in range(len(trajectory) - 1):
-        obs_before = trajectory[step_idx]
-        obs_after = trajectory[step_idx + 1]
-        # Find patients who got medicine between these observations
-        for patient_before in obs_before.ward_state.patients:
-            patient_after = next(
-                (p for p in obs_after.ward_state.patients if p.bed_id == patient_before.bed_id),
-                None,
-            )
-            if patient_after:
-                # Check if medicine was administered (medications_due decreased)
-                if len(patient_after.medications_due) < len(patient_before.medications_due):
-                    # And patient had escalation > 0 before the medicine was given
-                    if patient_before.escalation_level > 0:
-                        conflicts_resolved += 1
-
-    # Calculate deteriorations handled: vitals checked on patient with escalation_level >= 2
-    for step_idx in range(len(trajectory) - 1):
-        obs_before = trajectory[step_idx]
-        obs_after = trajectory[step_idx + 1]
-        # Find patients who got vitals checked between these observations
-        for patient_before in obs_before.ward_state.patients:
-            patient_after = next(
-                (p for p in obs_after.ward_state.patients if p.bed_id == patient_before.bed_id),
-                None,
-            )
-            if patient_after:
-                # Check if vitals were checked (vitals_due went from True to False)
-                if patient_before.vitals_due and not patient_after.vitals_due:
-                    # And patient had escalation >= 2 before vitals were checked
-                    if patient_before.escalation_level >= 2:
-                        deteriorations_handled += 1
-
-    return SakhaEpisodeMetrics(
-        meds_administered=meds,
-        vitals_checked=vitals,
-        escalations=escalations,
-        missed_escalations=missed_escalations,
-        conflicts_resolved=conflicts_resolved,
-        deteriorations_handled=deteriorations_handled,
-    )
+    return _ratio(productive, total_steps)
 
 
 def score_easy_task(trajectory: list[SakhaObservation]) -> float:
-    if not trajectory:
+    patients = _final_patients(trajectory)
+    if not patients:
         return 0.0
 
-    total_patients = len(trajectory[0].ward_state.patients)
-    if total_patients == 0:
-        return 0.0
-
-    final = _count_final_metrics(trajectory)
-    med_score = _compute_med_score(final.meds_administered, total_patients)
-    vitals_score = _compute_vitals_score(final.vitals_checked, total_patients)
-
-    return round(0.5 * med_score + 0.5 * vitals_score, 4)
+    med_completion = _ratio(
+        _sum_metric(patients, "medication_tasks_completed"),
+        _sum_metric(patients, "medication_tasks_completed")
+        + sum(len(patient.medications_due) > 0 for patient in patients),
+    )
+    med_timeliness = _ratio(
+        _sum_metric(patients, "medication_tasks_on_time"),
+        _sum_metric(patients, "medication_tasks_completed"),
+    )
+    vitals_completion = _ratio(
+        _sum_metric(patients, "vitals_tasks_completed"),
+        _sum_metric(patients, "vitals_tasks_completed")
+        + sum(patient.vitals_due for patient in patients),
+    )
+    vitals_timeliness = _ratio(
+        _sum_metric(patients, "vitals_tasks_on_time"),
+        _sum_metric(patients, "vitals_tasks_completed"),
+    )
+    overdue_penalty = min(0.25, _sum_metric(patients, "overdue_tasks") * 0.03)
+    base = (
+        0.3 * med_completion
+        + 0.25 * med_timeliness
+        + 0.2 * vitals_completion
+        + 0.15 * vitals_timeliness
+        + 0.1 * _action_quality(trajectory)
+    )
+    return round(max(0.0, min(1.0, base - overdue_penalty)), 4)
 
 
 def score_medium_task(trajectory: list[SakhaObservation]) -> float:
-    if not trajectory:
+    patients = _final_patients(trajectory)
+    if not patients:
         return 0.0
 
-    total_patients = len(trajectory[0].ward_state.patients)
-    if total_patients == 0:
-        return 0.0
-
-    final = _count_final_metrics(trajectory)
-    med_score = _compute_med_score(final.meds_administered, total_patients)
-    vitals_score = _compute_vitals_score(final.vitals_checked, total_patients)
-    conflict_score = min(1.0, final.conflicts_resolved / max(1, total_patients // 2))
-
-    return round(0.4 * med_score + 0.3 * vitals_score + 0.3 * conflict_score, 4)
+    routine_score = score_easy_task(trajectory)
+    total_incidents = _sum_metric(patients, "critical_incidents_total")
+    admissions_completed = _sum_metric(patients, "admissions_completed")
+    admissions_on_time = _sum_metric(patients, "admissions_on_time")
+    resolved = _sum_metric(patients, "critical_incidents_resolved")
+    resolved_on_time = _sum_metric(patients, "critical_incidents_resolved_in_time")
+    documented = _sum_metric(patients, "documentation_count")
+    alerts = _sum_metric(patients, "doctor_alert_count")
+    critical_success = _ratio(resolved, total_incidents)
+    critical_timeliness = _ratio(resolved_on_time, total_incidents)
+    workflow_score = _ratio(min(documented, alerts), max(1, total_incidents))
+    admission_score = _ratio(admissions_on_time, max(1, admissions_completed))
+    missed_penalty = min(0.35, _sum_metric(patients, "critical_incidents_missed") * 0.08)
+    base = (
+        0.4 * routine_score
+        + 0.22 * critical_success
+        + 0.18 * critical_timeliness
+        + 0.1 * workflow_score
+        + 0.1 * admission_score
+    )
+    return round(max(0.0, min(1.0, base - missed_penalty)), 4)
 
 
 def score_hard_task(trajectory: list[SakhaObservation]) -> float:
-    if not trajectory:
+    patients = _final_patients(trajectory)
+    if not patients:
         return 0.0
 
-    total_patients = len(trajectory[0].ward_state.patients)
-    if total_patients == 0:
-        return 0.0
-
-    final = _count_final_metrics(trajectory)
-    med_score = _compute_med_score(final.meds_administered, total_patients)
-    vitals_score = _compute_vitals_score(final.vitals_checked, total_patients)
-    escalation_score = min(1.0, final.escalations / max(1, total_patients // 4))
-    deterioration_score = min(1.0, final.deteriorations_handled / max(1, total_patients // 3))
-    penalty = final.missed_escalations * 0.05
-
-    base = (
-        0.3 * med_score + 0.2 * vitals_score + 0.25 * escalation_score + 0.25 * deterioration_score
+    medium_score = score_medium_task(trajectory)
+    total_incidents = _sum_metric(patients, "critical_incidents_total")
+    admissions_completed = _sum_metric(patients, "admissions_completed")
+    admissions_on_time = _sum_metric(patients, "admissions_on_time")
+    admissions_total = sum(1 for patient in patients if patient.admission_step > 0)
+    resolved = _sum_metric(patients, "critical_incidents_resolved")
+    resolved_on_time = _sum_metric(patients, "critical_incidents_resolved_in_time")
+    discharge_score = _ratio(
+        sum(1 for patient in patients if patient.discharge_prepared),
+        max(1, len(patients) // 3),
     )
-    return round(max(0.0, base - penalty), 4)
+    review_score = _ratio(
+        _sum_metric(patients, "reviews_completed"),
+        max(len(patients), len(trajectory) // 6),
+    )
+    backlog_control = _ratio(resolved, total_incidents)
+    admission_score = _ratio(admissions_on_time, max(1, admissions_completed))
+    overdue_penalty = min(0.08, _sum_metric(patients, "overdue_tasks") * 0.001)
+    workload_penalty = min(
+        0.12,
+        max(0, total_incidents - 4) * 0.015 + max(0, admissions_total - 2) * 0.005,
+    )
+    base = (
+        0.3 * medium_score
+        + 0.2 * _ratio(resolved, total_incidents)
+        + 0.1 * _ratio(resolved_on_time, total_incidents)
+        + 0.1 * discharge_score
+        + 0.05 * review_score
+        + 0.1 * backlog_control
+        + 0.05 * admission_score
+    )
+    return round(max(0.0, min(1.0, base - overdue_penalty - workload_penalty)), 4)
