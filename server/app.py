@@ -1,8 +1,10 @@
 import os
-from openenv.core.env_server.http_server import create_app
+
 from fastapi.responses import RedirectResponse
-from sakha.models import SakhaAction, SakhaObservation
+from openenv.core.env_server.http_server import create_app
+
 from sakha.env import SakhaEnvironment
+from sakha.models import SakhaAction, SakhaObservation
 
 os.environ["ENABLE_WEB_INTERFACE"] = "true"
 
