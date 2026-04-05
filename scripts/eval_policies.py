@@ -4,9 +4,8 @@ import sys
 from pathlib import Path
 
 from sakha.env import SakhaEnvironment
-from sakha.models import SakhaAction
-from sakha.graders import score_easy_task, score_medium_task, score_hard_task
-
+from sakha.graders import score_easy_task, score_hard_task, score_medium_task
+from sakha.models import ActionType, SakhaAction
 
 TASK_GRADERS = {
     "easy": score_easy_task,
@@ -17,55 +16,32 @@ PATIENT_COUNTS = {"easy": 5, "medium": 8, "hard": 18}
 
 
 def noop_policy(obs, step, pc):
-    return SakhaAction(action_type="noop", patient_id=None)
+    return SakhaAction(action_type=ActionType.NOOP, patient_id=None)
 
 
 def greedy_policy(obs, step, pc):
-    return SakhaAction(action_type="administer_medicine", patient_id=(step % pc) + 1)
-
-
-def _abnormal(patient) -> bool:
-    if patient.last_vitals is None:
-        return False
-    vitals = patient.last_vitals
-    return vitals.temperature >= 39.0 or vitals.spo2 < 93 or vitals.pulse >= 100
+    return SakhaAction(action_type=ActionType.ADMINISTER_MEDICINE, patient_id=(step % pc) + 1)
 
 
 def priority_policy(obs, step, pc):
-    patients = obs.ward_state.patients
+    if obs.ward_state.pending_tasks:
+        task = obs.ward_state.pending_tasks[0]
+        return SakhaAction(action_type=task.required_action, patient_id=task.patient_id)
 
-    for patient in patients:
-        if patient.escalation_level >= 2:
-            return SakhaAction(action_type="escalate", patient_id=patient.bed_id)
-
-    for patient in patients:
-        if patient.vitals_due and (patient.escalation_level >= 1 or _abnormal(patient)):
-            return SakhaAction(action_type="check_vitals", patient_id=patient.bed_id)
-
-    for patient in patients:
-        if patient.medications_due and patient.escalation_level >= 1:
-            return SakhaAction(action_type="administer_medicine", patient_id=patient.bed_id)
-
-    for patient in patients:
-        if patient.vitals_due:
-            return SakhaAction(action_type="check_vitals", patient_id=patient.bed_id)
-
-    for patient in patients:
-        if patient.medications_due:
-            return SakhaAction(action_type="administer_medicine", patient_id=patient.bed_id)
-
-    return SakhaAction(action_type="noop")
+    return SakhaAction(action_type=ActionType.NOOP, patient_id=None)
 
 
 def timestep_scripted_policy(obs, step, pc):
     if step < 10:
-        return SakhaAction(action_type="administer_medicine", patient_id=(step % pc) + 1)
+        return SakhaAction(action_type=ActionType.ADMINISTER_MEDICINE, patient_id=(step % pc) + 1)
     elif step < 20:
-        return SakhaAction(action_type="check_vitals", patient_id=((step - 5) % pc) + 1)
+        return SakhaAction(action_type=ActionType.CHECK_VITALS, patient_id=((step - 5) % pc) + 1)
     elif step < 30:
-        return SakhaAction(action_type="administer_medicine", patient_id=((step - 10) % pc) + 1)
+        return SakhaAction(
+            action_type=ActionType.ADMINISTER_MEDICINE, patient_id=((step - 10) % pc) + 1
+        )
     else:
-        return SakhaAction(action_type="noop")
+        return SakhaAction(action_type=ActionType.NOOP)
 
 
 POLICIES = {
