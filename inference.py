@@ -28,16 +28,27 @@ from dotenv import load_dotenv
 from openai import OpenAI
 
 from sakha.env import SakhaEnvironment
+from sakha.formatters import (
+    CompactFormatter,
+    EpisodeResult,
+    Formatter,
+    JSONFormatter,
+    StepData,
+    get_formatter,
+)
 from sakha.graders import score_easy_task, score_hard_task, score_medium_task
 from sakha.models import ActionType, SakhaAction, SakhaObservation
 
 load_dotenv()
 
 logging.basicConfig(
-    level=logging.INFO,
+    level=logging.WARNING,
     format="%(asctime)s [%(levelname)s] %(message)s",
     handlers=[logging.StreamHandler(sys.stdout)],
 )
+for logger_name in ("httpx", "openai", "httpcore", "httpcore.http11"):
+    logging.getLogger(logger_name).setLevel(logging.WARNING)
+
 logger = logging.getLogger("sakha")
 
 
@@ -54,10 +65,12 @@ API_BASE_URL = os.getenv("API_BASE_URL", "https://router.huggingface.co/v1")
 API_KEY = os.getenv("HF_TOKEN") or os.getenv("API_KEY") or os.getenv("OPENAI_API_KEY")
 MODEL_NAME = os.getenv("MODEL_NAME", "microsoft/Phi-3-mini-4k-instruct")
 REQUEST_DELAY = float(os.getenv("REQUEST_DELAY", "0"))
+PROMPT_PROFILE = os.getenv("PROMPT_PROFILE", "operational_realism").strip()
+ALLOWED_PROMPT_PROFILES = {"operational_realism", "strict_bedside", "full_legacy"}
 
 MAX_STEPS = 96
-TEMPERATURE = 0.2
-MAX_TOKENS = 150
+TEMPERATURE = 0.0
+MAX_TOKENS = 64
 FALLBACK_ACTION = SakhaAction(action_type=ActionType.REVIEW_PATIENT, patient_id=1)
 ACTION_ID_TO_TYPE = {
     "A0": ActionType.REVIEW_PATIENT,
@@ -76,33 +89,85 @@ TASK_GRADERS = {
     "hard": score_hard_task,
 }
 
+MEDICATION_GRACE_STEPS = 2
+VITALS_GRACE_STEPS = 1
+
+
+def serialize_compact_patient(patient) -> dict[str, object]:
+    last_vitals = getattr(patient, "last_vitals", None)
+    last_vitals_payload = None
+    if last_vitals is not None:
+        last_vitals_payload = {
+            "bp_sys": int(getattr(last_vitals, "blood_pressure_sys", 0) or 0),
+            "bp_dia": int(getattr(last_vitals, "blood_pressure_dia", 0) or 0),
+            "temp": float(getattr(last_vitals, "temperature", 0.0) or 0.0),
+            "spo2": int(getattr(last_vitals, "spo2", 0) or 0),
+            "pulse": int(getattr(last_vitals, "pulse", 0) or 0),
+        }
+
+    return {
+        "bed": int(getattr(patient, "bed_id", -1) or -1),
+        "diag": str(getattr(patient, "diagnosis", "")),
+        "meds": len(getattr(patient, "medications_due", []) or []),
+        "med_step": int(getattr(patient, "medication_due_by_step", -1) or -1),
+        "vitals": bool(getattr(patient, "vitals_due", False)),
+        "vit_step": int(getattr(patient, "vitals_due_by_step", -1) or -1),
+        "esc": int(getattr(patient, "escalation_level", 0) or 0),
+        "rev": bool(getattr(patient, "review_required", False)),
+        "rev_step": int(getattr(patient, "last_reviewed_step", -1) or -1),
+        "inc": int(getattr(patient, "active_incident_id", -1) or -1),
+        "discharge": bool(getattr(patient, "discharge_prepared", False)),
+        "adm_req": bool(getattr(patient, "admission_review_required", False)),
+        "adm_reviewed": bool(getattr(patient, "admission_reviewed", False)),
+        "adm_documented": bool(getattr(patient, "admission_documented", False)),
+        "last_vitals": last_vitals_payload,
+    }
+
 
 def build_user_prompt(
     observation: SakhaObservation,
     step: int,
     history: list[str],
+    prompt_profile: str,
     scratchpad: str | None = None,
 ) -> str:
     ward = observation.ward_state
 
+    patients_payload = [serialize_compact_patient(p) for p in ward.patients]
+    if prompt_profile == "full_legacy":
+        patients_payload = [p.model_dump() for p in ward.patients]
+
     state_payload = {
         "step": step,
         "time_remaining_minutes": observation.time_remaining_minutes,
-        "pending_count": observation.pending_count,
-        "pending_tasks": [task.model_dump(mode="json") for task in ward.pending_tasks[:12]],
-        "patients": [p.model_dump() for p in ward.patients],
+        "patients": patients_payload,
         "recent_actions": history[-3:] if history else [],
+        "action_result": (
+            {
+                "status": observation.action_result.status,
+                "detail": observation.action_result.detail,
+            }
+            if observation.action_result
+            else None
+        ),
     }
+
+    if prompt_profile == "operational_realism":
+        state_payload["pending_count"] = observation.pending_count
+    elif prompt_profile == "strict_bedside":
+        pass
+    elif prompt_profile == "full_legacy":
+        state_payload["pending_count"] = observation.pending_count
+        state_payload["pending_tasks"] = [
+            task.model_dump(mode="json") for task in ward.pending_tasks
+        ]
+    else:
+        raise ValueError(f"Invalid PROMPT_PROFILE: {prompt_profile}")
 
     prompt_parts = [
         "STATE JSON:",
         json.dumps(state_payload, separators=(",", ":")),
     ]
-
-    if observation.action_result:
-        prompt_parts.append(
-            f"ACTION RESULT: {observation.action_result.status} — {observation.action_result.detail}"
-        )
 
     if scratchpad:
         prompt_parts.append(f"YOUR PREVIOUS NOTES: {scratchpad}")
@@ -115,13 +180,9 @@ def build_user_prompt(
 SYSTEM_PROMPT = textwrap.dedent(
     """
     You are a hospital ward assistant AI managing a full ward shift.
-
-    The state includes a deterministic pending_tasks queue. Prefer the highest-priority task unless a recent action result shows that the workflow step is invalid.
-    Critical incidents must be handled in this order:
+    Use only the provided state JSON.
+    Critical incidents must be handled in this exact order:
     check_vitals -> alert_doctor -> escalate -> update_chart.
-    review_patient is for routine rounding and recovering bedside context when details are stale.
-    medication_round is a ward-level med pass covering all currently due medication tasks.
-    ward_sweep is a lightweight indirect ward-management task for quiet periods.
 
     ACTION IDS:
     - A0 = review_patient(patient_id)
@@ -134,20 +195,13 @@ SYSTEM_PROMPT = textwrap.dedent(
     - A7 = ward_sweep()
 
     REQUIRED OUTPUT FORMAT:
-    You must provide your reasoning followed by the JSON action in a fenced code block.
-
-    Example:
-    Reasoning: Patient 4 has an escalation level of 2 and vitals are due. I will check vitals first to document the deterioration before escalating.
-    ```json
+    Return JSON only. No prose, no markdown, no code fences.
+    Output schema:
     {
-      "chosen_action_id": "A2",
-      "chosen_patient_id": 4,
-      "scratchpad": "P3 temp 39.5 → escalated. P7 needs vitals next."
+      "chosen_action_id": "A0|A1|A2|A3|A4|A5|A6|A7",
+      "chosen_patient_id": <integer or null>,
+      "scratchpad": <optional string>
     }
-    ```
-
-    The "scratchpad" field is optional — use it to track your notes across steps.
-    Only one JSON block is allowed.
     """
 ).strip()
 
@@ -204,18 +258,83 @@ def get_eligible_candidates(observation: SakhaObservation) -> dict[str, list[int
 
 
 def rank_candidates(observation: SakhaObservation) -> list[tuple[int, str, int | None]]:
-    ranked: list[tuple[int, str, int | None]] = []
-    for task in observation.ward_state.pending_tasks:
-        action_id = next(
-            (key for key, value in ACTION_ID_TO_TYPE.items() if value == task.required_action),
-            None,
+    scored: list[tuple[int, int, int, str, int | None]] = []
+
+    patients = [
+        p for p in observation.ward_state.patients if not getattr(p, "discharge_prepared", False)
+    ]
+
+    medication_due_patients = [p for p in patients if bool(getattr(p, "medications_due", []))]
+    if medication_due_patients:
+        earliest_due = min(
+            int(getattr(p, "medication_due_by_step", -1) or -1) for p in medication_due_patients
         )
-        if action_id is None:
+        overdue = any(
+            earliest_due >= 0
+            and observation.ward_state.current_step > earliest_due + MEDICATION_GRACE_STEPS
+            for _ in [0]
+        )
+        priority = 510 if overdue else 410
+        scored.append((priority, earliest_due if earliest_due >= 0 else 10**9, 10**9, "A1", None))
+
+    for patient in patients:
+        bed_id = int(getattr(patient, "bed_id", 10**9) or 10**9)
+        incident_id = int(getattr(patient, "active_incident_id", -1) or -1)
+        incident_due = int(getattr(patient, "incident_deadline_step", 10**9) or 10**9)
+        if incident_id >= 0:
+            if not bool(getattr(patient, "incident_checked", False)):
+                scored.append((650, incident_due, bed_id, "A2", bed_id))
+            elif not bool(getattr(patient, "incident_alerted", False)):
+                scored.append((640, incident_due, bed_id, "A4", bed_id))
+            elif not bool(getattr(patient, "incident_escalated", False)):
+                scored.append((630, incident_due, bed_id, "A3", bed_id))
+            elif not bool(getattr(patient, "incident_documented", False)):
+                scored.append((620, incident_due + 1, bed_id, "A5", bed_id))
             continue
-        urgency_bonus = 20 if task.overdue else 0
-        ranked.append((task.priority + urgency_bonus, action_id, task.patient_id))
-    ranked.sort(key=lambda item: (-item[0], item[2] if item[2] is not None else -1, item[1]))
-    return ranked
+
+        if bool(getattr(patient, "vitals_due", False)):
+            vitals_due = int(getattr(patient, "vitals_due_by_step", 10**9) or 10**9)
+            overdue = (
+                vitals_due >= 0
+                and observation.ward_state.current_step > vitals_due + VITALS_GRACE_STEPS
+            )
+            priority = 520 if overdue else 420
+            scored.append((priority, vitals_due, bed_id, "A2", bed_id))
+
+        if bool(getattr(patient, "admission_review_required", False)):
+            admission_due = int(getattr(patient, "admission_due_step", 10**9) or 10**9)
+            if not bool(getattr(patient, "admission_reviewed", False)):
+                scored.append((350, admission_due, bed_id, "A0", bed_id))
+            elif not bool(getattr(patient, "admission_documented", False)):
+                scored.append((340, admission_due, bed_id, "A5", bed_id))
+
+        if bool(getattr(patient, "review_required", False)):
+            scored.append((220, observation.ward_state.current_step + 1, bed_id, "A0", bed_id))
+
+        ready_for_discharge = (
+            incident_id < 0
+            and int(getattr(patient, "escalation_level", 0) or 0) == 0
+            and not bool(getattr(patient, "medications_due", []))
+            and not bool(getattr(patient, "vitals_due", False))
+            and not bool(getattr(patient, "admission_review_required", False))
+            and int(getattr(patient, "last_documented_step", -1) or -1)
+            >= observation.ward_state.current_step - 10
+            and int(getattr(patient, "last_reviewed_step", -1) or -1)
+            >= observation.ward_state.current_step - 10
+            and observation.ward_state.current_step
+            - int(getattr(patient, "admission_step", 0) or 0)
+            >= 12
+        )
+        if ready_for_discharge:
+            scored.append((210, observation.ward_state.current_step + 4, bed_id, "A6", bed_id))
+
+    if not scored:
+        scored.append((100, observation.ward_state.current_step + 1, 10**9, "A7", None))
+
+    scored.sort(key=lambda item: (-item[0], item[1], item[2], item[3]))
+    return [
+        (priority, action_id, patient_id) for priority, _due, _bed, action_id, patient_id in scored
+    ]
 
 
 def select_action(
@@ -265,9 +384,12 @@ def run_episode(
     client,
     task: str,
     seed: int,
+    episode_index: int,
     max_steps: int = 96,
     verbose: bool = False,
     deterministic_baseline: bool = False,
+    prompt_profile: str = "operational_realism",
+    formatter: Formatter | None = None,
 ) -> dict:
     started_at = time.perf_counter()
     patient_count = 5 if task == "easy" else (8 if task == "medium" else 18)
@@ -282,17 +404,16 @@ def run_episode(
         "completion_tokens": 0,
         "total_tokens": 0,
     }
+    mode = "deterministic" if deterministic_baseline else "llm"
 
-    if verbose:
-        print(f"\n{'=' * 60}")
-        print(f"Task: {task} | Patients: {patient_count} | Seed: {seed}")
-        print(f"{'=' * 60}")
+    formatter = formatter or CompactFormatter()
+    formatter.start_episode(task, seed, patient_count, max_steps, mode)
 
     for step in range(1, max_steps + 1):
         if deterministic_baseline:
             action = deterministic_policy(obs, step, patient_count)
         else:
-            user_prompt = build_user_prompt(obs, step, history, scratchpad)
+            user_prompt = build_user_prompt(obs, step, history, prompt_profile, scratchpad)
             try:
                 completion = call_llm(
                     client,
@@ -311,17 +432,13 @@ def run_episode(
                     usage_totals["total_tokens"] += int(getattr(usage, "total_tokens", 0) or 0)
                 response_text = completion.choices[0].message.content or "" if completion else ""
             except Exception as exc:
-                if verbose:
-                    print(f"  LLM error: {exc}")
+                print(f"  LLM error at step {step}: {exc}", flush=True)
                 response_text = ""
             model_payload = extract_model_decision(response_text)
             action, scratchpad = select_action(obs, model_payload)
 
             if REQUEST_DELAY > 0:
                 time.sleep(REQUEST_DELAY)
-
-        if verbose:
-            print(f"  Step {step}: {action.action_type}(patient={action.patient_id})")
 
         obs = env.step(action)
         trajectory.append(obs)
@@ -339,8 +456,25 @@ def run_episode(
             history_entry = f"{action_id}(patient={action.patient_id}):reward={reward:+.2f}"
         history.append(history_entry)
 
+        action_name = getattr(action.action_type, "value", action.action_type)
+        status = obs.action_result.status if obs.action_result else "none"
+        step_data = StepData(
+            step_num=step,
+            action_name=str(action_name),
+            patient_id=action.patient_id,
+            reward=reward,
+            status=status,
+            done=obs.done,
+        )
+        formatter.step(step_data)
+
     grader = TASK_GRADERS[task]
     score = grader(trajectory)
+    final_patients = trajectory[-1].ward_state.patients if trajectory else []
+    critical_incidents_missed = sum(
+        int(getattr(patient, "critical_incidents_missed", 0) or 0) for patient in final_patients
+    )
+    runtime = round(time.perf_counter() - started_at, 4)
 
     result = {
         "task": task,
@@ -348,13 +482,22 @@ def run_episode(
         "steps": len(trajectory) - 1,
         "grader_score": score,
         "done": trajectory[-1].done,
-        "runtime_seconds": round(time.perf_counter() - started_at, 4),
+        "runtime_seconds": runtime,
         "mode": "deterministic" if deterministic_baseline else "llm",
         "usage": usage_totals,
+        "critical_incidents_missed": critical_incidents_missed,
     }
 
-    if verbose:
-        print(f"  Score: {score:.4f}")
+    episode_result = EpisodeResult(
+        task=task,
+        seed=seed,
+        score=score,
+        steps=len(trajectory) - 1,
+        done=trajectory[-1].done,
+        runtime_seconds=runtime,
+        critical_incidents_missed=critical_incidents_missed,
+    )
+    formatter.end_episode(episode_result)
 
     return result
 
@@ -367,8 +510,8 @@ def main() -> None:
     parser.add_argument(
         "--max-steps",
         type=int,
-        default=96,
-        help="Max steps per episode (default: 96 for full 8-hour shift)",
+        default=24,
+        help="Max steps per episode (default: 24 for fast dev loop)",
     )
     parser.add_argument("--verbose", action="store_true", help="Print detailed output")
     parser.add_argument(
@@ -380,7 +523,17 @@ def main() -> None:
         "--output-json",
         help="Optional path to write structured baseline results as JSON",
     )
+    parser.add_argument(
+        "--format",
+        default="compact",
+        choices=["compact", "pretty", "json"],
+        help="Output format (default: compact)",
+    )
     args = parser.parse_args()
+
+    if PROMPT_PROFILE not in ALLOWED_PROMPT_PROFILES:
+        print("ERROR: PROMPT_PROFILE must be one of operational_realism|strict_bedside|full_legacy")
+        sys.exit(2)
 
     deterministic_mode = args.deterministic_baseline
     aggregate_usage = {
@@ -397,13 +550,17 @@ def main() -> None:
 
     if deterministic_mode:
         print("MODE: deterministic baseline (local priority policy)")
+        print(f"PROMPT_PROFILE: {PROMPT_PROFILE}")
         client = None
     else:
         print(f"API_BASE_URL: {API_BASE_URL}")
         print(f"MODEL_NAME:   {MODEL_NAME}")
+        print(f"PROMPT_PROFILE: {PROMPT_PROFILE}")
         masked_api_key = f"{'*' * 8}...{API_KEY[-4:]}" if API_KEY else "********"
         print(f"API_KEY:      {masked_api_key}")
         client = OpenAI(base_url=API_BASE_URL, api_key=API_KEY, timeout=30.0)
+
+    formatter = get_formatter(args.format, args.output_json)
 
     tasks = args.tasks.split(",")
     all_results = []
@@ -418,9 +575,12 @@ def main() -> None:
                 client,
                 task,
                 seed,
+                episode_index=ep + 1,
                 max_steps=args.max_steps,
                 verbose=args.verbose,
                 deterministic_baseline=deterministic_mode,
+                prompt_profile=PROMPT_PROFILE,
+                formatter=formatter,
             )
             all_results.append(result)
             task_scores.append(result["grader_score"])
@@ -434,7 +594,6 @@ def main() -> None:
             sum(result["runtime_seconds"] for result in all_results if result["task"] == task),
             4,
         )
-        print(f"[{task}] avg_score={avg_score:.4f} (over {args.episodes} episodes)")
         task_summaries.append(
             {
                 "task": task,
@@ -444,30 +603,43 @@ def main() -> None:
             }
         )
 
-    print("\n=== Full Results ===")
-    print(json.dumps(all_results, indent=2))
-    if not deterministic_mode and aggregate_usage["requests"] > 0:
-        avg_prompt = aggregate_usage["prompt_tokens"] / aggregate_usage["requests"]
-        avg_completion = aggregate_usage["completion_tokens"] / aggregate_usage["requests"]
-        avg_total = aggregate_usage["total_tokens"] / aggregate_usage["requests"]
-        print("\n=== Token Usage ===")
-        print(f"Requests:           {aggregate_usage['requests']}")
-        print(f"Prompt tokens:      {aggregate_usage['prompt_tokens']}")
-        print(f"Completion tokens:  {aggregate_usage['completion_tokens']}")
-        print(f"Total tokens:       {aggregate_usage['total_tokens']}")
-        print(f"Avg prompt/request: {avg_prompt:.1f}")
-        print(f"Avg completion/req: {avg_completion:.1f}")
-        print(f"Avg total/request:  {avg_total:.1f}")
-    if args.output_json:
+    episode_results = [
+        EpisodeResult(
+            task=r["task"],
+            seed=r["seed"],
+            score=r["grader_score"],
+            steps=r["steps"],
+            done=r["done"],
+            runtime_seconds=r["runtime_seconds"],
+            critical_incidents_missed=r["critical_incidents_missed"],
+        )
+        for r in all_results
+    ]
+    formatter.summary(episode_results)
+
+    if args.format != "json" and args.output_json:
         payload = {
             "tasks": task_summaries,
             "episodes": all_results,
             "model_name": MODEL_NAME,
             "mode": "deterministic" if deterministic_mode else "llm",
+            "prompt_profile": PROMPT_PROFILE,
             "seed": args.seed,
             "max_steps": args.max_steps,
         }
-        Path(args.output_json).write_text(json.dumps(payload, indent=2) + "\n")
+        output_path = Path(args.output_json)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_text(json.dumps(payload, indent=2) + "\n")
+
+    if not args.output_json and not deterministic_mode and aggregate_usage["requests"] > 0:
+        print()
+        print("═" * 30)
+        print(" TOKEN USAGE")
+        print("═" * 30)
+        print(f"  Requests:      {aggregate_usage['requests']}")
+        print(f"  Prompt:       {aggregate_usage['prompt_tokens']:,}")
+        print(f"  Completion:   {aggregate_usage['completion_tokens']:,}")
+        print(f"  Total:       {aggregate_usage['total_tokens']:,}")
 
 
 if __name__ == "__main__":
