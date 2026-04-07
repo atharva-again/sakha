@@ -78,6 +78,23 @@ Pass/fail gate — HF Space deploys, OpenEnv spec compliance, Dockerfile builds,
 
 Scored — baseline agent re-run, standard Open LLM agent (e.g. Nemotron 3 Super) run against all environments, score variance check.
 
+#### Phase 2 Fail-Fast Structured Stdout Requirement
+
+Phase 2 can fail immediately if validator cannot parse structured run blocks from `inference.py` stdout.
+
+Required stdout blocks (example shape):
+
+- `[START] task=<TASK> episode=<N> seed=<SEED> mode=<llm|deterministic> max_steps=<M>`
+- `[STEP] task=<TASK> episode=<N> step=<K> action=<ACTION> patient_id=<ID|None> reward=<FLOAT> done=<true|false> status=<STATUS>`
+- `[END] task=<TASK> episode=<N> seed=<SEED> score=<FLOAT> steps=<COUNT> done=<true|false>`
+
+Rules:
+
+1. Print these lines to **stdout** (not stderr)
+2. Use `print(..., flush=True)`
+3. Do not suppress or redirect stdout inside `inference.py`
+4. Emit at least one START, one or more STEP, and one END per episode
+
 ### Phase 3: Human Review
 
 Top submissions reviewed by Meta and Hugging Face engineers for real-world utility, creativity, and exploit checks.
@@ -366,6 +383,7 @@ All must pass or you're disqualified.
 
 4. **Baseline reproduces**
    - Run the submitted inference script — must complete without error and produce scores
+   - Verify stdout contains parseable `[START]/[STEP]/[END]` blocks
 
 5. **3+ tasks with graders**
    - Enumerate tasks, run each grader, verify scores in 0.0–1.0 range
@@ -390,6 +408,14 @@ Before submitting, ensure the following variables are defined in your environmen
 ### Validator
 
 Run the pre-submission validation script before submitting.
+
+Quick local sanity run for Phase 2 block formatting:
+
+```bash
+uv run python inference.py --tasks easy --episodes 1 --seed 42 --deterministic-baseline --max-steps 5
+```
+
+Expected: stdout contains lines starting with `[START]`, `[STEP]`, and `[END]`.
 
 ---
 
