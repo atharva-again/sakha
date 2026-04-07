@@ -3,14 +3,14 @@ Sakha Ward Assistant — Baseline Inference Script
 =================================================
 
 Environment variables (MANDATORY):
-    API_BASE_URL    The API endpoint for the LLM (default: https://router.huggingface.co/v1)
-    MODEL_NAME      Model identifier (default: microsoft/Phi-3-mini-4k-instruct)
+    API_BASE_URL    The API endpoint for the LLM (default: https://api.groq.com/openai/v1)
+    MODEL_NAME      Model identifier (default: llama-3.1-8b-instant)
     HF_TOKEN        Your Hugging Face / API key
 
 Usage:
-    export API_BASE_URL="https://router.huggingface.co/v1"
+    export API_BASE_URL="https://api.groq.com/openai/v1"
     export HF_TOKEN="hf_your_token_here"
-    export MODEL_NAME="microsoft/Phi-3-mini-4k-instruct"
+    export MODEL_NAME="llama-3.1-8b-instant"
     python inference.py --tasks easy,medium,hard --seed 42 --episodes 3
 """
 
@@ -61,9 +61,9 @@ def call_llm(client, messages):
     )
 
 
-API_BASE_URL = os.getenv("API_BASE_URL", "https://router.huggingface.co/v1")
-API_KEY = os.getenv("HF_TOKEN") or os.getenv("API_KEY") or os.getenv("OPENAI_API_KEY")
-MODEL_NAME = os.getenv("MODEL_NAME", "microsoft/Phi-3-mini-4k-instruct")
+API_BASE_URL = os.getenv("API_BASE_URL", "https://api.groq.com/openai/v1")
+HF_TOKEN = os.getenv("HF_TOKEN")
+MODEL_NAME = os.getenv("MODEL_NAME", "llama-3.1-8b-instant")
 REQUEST_DELAY = float(os.getenv("REQUEST_DELAY", "0"))
 PROMPT_PROFILE = os.getenv("PROMPT_PROFILE", "operational_realism").strip()
 ALLOWED_PROMPT_PROFILES = {"operational_realism", "strict_bedside", "full_legacy"}
@@ -406,8 +406,8 @@ def run_episode(
     }
     mode = "deterministic" if deterministic_baseline else "llm"
 
-    formatter = formatter or CompactFormatter()
-    formatter.start_episode(task, seed, patient_count, max_steps, mode)
+    run_formatter: Formatter = formatter or CompactFormatter()
+    run_formatter.start_episode(task, episode_index, seed, patient_count, max_steps, mode)
 
     for step in range(1, max_steps + 1):
         if deterministic_baseline:
@@ -459,6 +459,8 @@ def run_episode(
         action_name = getattr(action.action_type, "value", action.action_type)
         status = obs.action_result.status if obs.action_result else "none"
         step_data = StepData(
+            task=task,
+            episode=episode_index,
             step_num=step,
             action_name=str(action_name),
             patient_id=action.patient_id,
@@ -466,7 +468,7 @@ def run_episode(
             status=status,
             done=obs.done,
         )
-        formatter.step(step_data)
+        run_formatter.step(step_data)
 
     grader = TASK_GRADERS[task]
     score = grader(trajectory)
@@ -490,6 +492,7 @@ def run_episode(
 
     episode_result = EpisodeResult(
         task=task,
+        episode=episode_index,
         seed=seed,
         score=score,
         steps=len(trajectory) - 1,
@@ -497,7 +500,7 @@ def run_episode(
         runtime_seconds=runtime,
         critical_incidents_missed=critical_incidents_missed,
     )
-    formatter.end_episode(episode_result)
+    run_formatter.end_episode(episode_result)
 
     return result
 
@@ -543,7 +546,7 @@ def main() -> None:
         "total_tokens": 0,
     }
 
-    if not deterministic_mode and not API_KEY:
+    if not deterministic_mode and not HF_TOKEN:
         print("ERROR: Set HF_TOKEN environment variable, or use --deterministic-baseline")
         print("  export HF_TOKEN='hf_your_token_here'")
         sys.exit(1)
@@ -556,9 +559,9 @@ def main() -> None:
         print(f"API_BASE_URL: {API_BASE_URL}")
         print(f"MODEL_NAME:   {MODEL_NAME}")
         print(f"PROMPT_PROFILE: {PROMPT_PROFILE}")
-        masked_api_key = f"{'*' * 8}...{API_KEY[-4:]}" if API_KEY else "********"
+        masked_api_key = f"{'*' * 8}...{HF_TOKEN[-4:]}" if HF_TOKEN else "********"
         print(f"API_KEY:      {masked_api_key}")
-        client = OpenAI(base_url=API_BASE_URL, api_key=API_KEY, timeout=30.0)
+        client = OpenAI(base_url=API_BASE_URL, api_key=HF_TOKEN, timeout=30.0)
 
     formatter = get_formatter(args.format, args.output_json)
 
@@ -606,6 +609,7 @@ def main() -> None:
     episode_results = [
         EpisodeResult(
             task=r["task"],
+            episode=-1,
             seed=r["seed"],
             score=r["grader_score"],
             steps=r["steps"],

@@ -45,6 +45,8 @@ class ScoreBar:
 
 @dataclass
 class StepData:
+    task: str
+    episode: int
     step_num: int
     action_name: str
     patient_id: int | None
@@ -56,6 +58,7 @@ class StepData:
 @dataclass
 class EpisodeResult:
     task: str
+    episode: int
     seed: int
     score: float
     steps: int
@@ -67,7 +70,13 @@ class EpisodeResult:
 class Formatter(ABC):
     @abstractmethod
     def start_episode(
-        self, task: str, seed: int, patient_count: int, max_steps: int, mode: str
+        self,
+        task: str,
+        episode: int,
+        seed: int,
+        patient_count: int,
+        max_steps: int,
+        mode: str,
     ) -> None:
         pass
 
@@ -86,30 +95,36 @@ class Formatter(ABC):
 
 class CompactFormatter(Formatter):
     def start_episode(
-        self, task: str, seed: int, patient_count: int, max_steps: int, mode: str
+        self,
+        task: str,
+        episode: int,
+        seed: int,
+        patient_count: int,
+        max_steps: int,
+        mode: str,
     ) -> None:
+        mode_value = "deterministic" if mode == "deterministic" else "llm"
         print(
-            f"[START] {task} | seed={seed} | "
-            f"mode={'det' if mode == 'deterministic' else 'llm'} | max_steps={max_steps}",
+            f"[START] task={task} episode={episode} seed={seed} "
+            f"mode={mode_value} max_steps={max_steps}",
             flush=True,
         )
 
     def step(self, data: StepData) -> None:
-        patient_id_str = str(data.patient_id) if data.patient_id else "-"
-        reward_str = f"{data.reward:+.4f}" if data.reward != 0 else "0.0000"
-        done_str = "1" if data.done else "0"
+        patient_id_str = str(data.patient_id) if data.patient_id is not None else "None"
+        reward_str = f"{data.reward:.4f}"
+        done_str = str(data.done).lower()
         print(
-            f"[{data.step_num:>2}] patient={patient_id_str:<2} "
-            f"action={data.action_name:<16} reward={reward_str} "
-            f"status={data.status} done={done_str}",
+            f"[STEP] task={data.task} episode={data.episode} step={data.step_num} "
+            f"action={data.action_name} patient_id={patient_id_str} "
+            f"reward={reward_str} done={done_str} status={data.status}",
             flush=True,
         )
 
     def end_episode(self, result: EpisodeResult) -> None:
         print(
-            f"[END] {result.task} | score={result.score:.4f} | "
-            f"steps={result.steps} | done={str(result.done).lower()} | "
-            f"runtime={result.runtime_seconds:.4f}s",
+            f"[END] task={result.task} episode={result.episode} seed={result.seed} "
+            f"score={result.score:.4f} steps={result.steps} done={str(result.done).lower()}",
             flush=True,
         )
 
@@ -141,7 +156,13 @@ class CompactFormatter(Formatter):
 
 class PrettyFormatter(Formatter):
     def start_episode(
-        self, task: str, seed: int, patient_count: int, max_steps: int, mode: str
+        self,
+        task: str,
+        episode: int,
+        seed: int,
+        patient_count: int,
+        max_steps: int,
+        mode: str,
     ) -> None:
         task_label = task.upper()
         print()
@@ -209,7 +230,13 @@ class JSONFormatter(Formatter):
         self.results: list[dict] = []
 
     def start_episode(
-        self, task: str, seed: int, patient_count: int, max_steps: int, mode: str
+        self,
+        task: str,
+        episode: int,
+        seed: int,
+        patient_count: int,
+        max_steps: int,
+        mode: str,
     ) -> None:
         pass
 
@@ -220,6 +247,7 @@ class JSONFormatter(Formatter):
         self.results.append(
             {
                 "task": result.task,
+                "episode": result.episode,
                 "seed": result.seed,
                 "grader_score": result.score,
                 "steps": result.steps,

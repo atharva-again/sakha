@@ -22,7 +22,7 @@ Provides signal over the full trajectory (not just binary end-of-episode). Rewar
 
 ### Baseline inference script
 
-Uses the OpenAI API client to run a model against the environment. Reads API credentials from environment variables (OPENAI_API_KEY). Produces a reproducible baseline score on all 3 tasks.
+Uses the OpenAI-compatible API client to run a model against the environment. Reads API credentials from environment variables (`API_BASE_URL`, `MODEL_NAME`, `HF_TOKEN`). Produces a reproducible baseline score on all 3 tasks.
 
 ## Non-Functional Requirements
 
@@ -135,9 +135,9 @@ from PIL import Image
 
 from browsergym_env import BrowserGymAction, BrowserGymEnv
 
-API_BASE_URL = os.getenv("API_BASE_URL") // "https://router.huggingface.co/v1"
-API_KEY = os.getenv("HF_TOKEN") or os.getenv("API_KEY")
-MODEL_NAME = os.getenv("MODEL_NAME")
+API_BASE_URL = os.getenv("API_BASE_URL", "https://api.groq.com/openai/v1")
+HF_TOKEN = os.getenv("HF_TOKEN")
+MODEL_NAME = os.getenv("MODEL_NAME", "llama-3.1-8b-instant")
 MAX_STEPS = 8
 MAX_DOM_CHARS = 3500
 TEMPERATURE = 0.2
@@ -274,7 +274,7 @@ def parse_model_action(response_text: str) -> str:
 
 
 def main() -> None:
-    client = OpenAI(base_url=API_BASE_URL, api_key=API_KEY)
+    client = OpenAI(base_url=API_BASE_URL, api_key=HF_TOKEN)
 
     env = BrowserGymEnv.from_docker_image(
         image="browsergym-env:latest",
@@ -369,6 +369,39 @@ if __name__ == "__main__":
 ## Pre-Submission Checklist
 
 All must pass or you're disqualified.
+
+### Sakha Quick Checklist (the 5 UI checkboxes)
+
+Use this section instead of screenshots before every submission:
+
+1. **Read and follow sample `inference.py` strictly**
+   - Keep `inference.py` in repo root.
+   - Use `from openai import OpenAI`.
+   - Initialize with env-driven config: `OpenAI(base_url=API_BASE_URL, api_key=HF_TOKEN)`.
+
+2. **Environment variables present in `inference.py`**
+   - `API_BASE_URL`
+   - `MODEL_NAME`
+   - `HF_TOKEN`
+   - Optional only if needed by your environment wrapper: `LOCAL_IMAGE_NAME`
+
+3. **Defaults only for API_BASE_URL and MODEL_NAME (not HF_TOKEN)**
+   - ✅ allowed defaults:
+     - `API_BASE_URL = os.getenv("API_BASE_URL", "https://api.groq.com/openai/v1")`
+     - `MODEL_NAME = os.getenv("MODEL_NAME", "llama-3.1-8b-instant")`
+   - ✅ no default token:
+     - `HF_TOKEN = os.getenv("HF_TOKEN")`
+
+4. **All LLM calls use the configured OpenAI client**
+   - All generation calls must be made through that initialized `client` object.
+   - Do not mix in other SDK clients for model inference.
+
+5. **Structured stdout format is exact (`START` / `STEP` / `END`)**
+   - Emit parseable blocks to stdout for every episode:
+     - `[START] task=<TASK> episode=<N> seed=<SEED> mode=<llm|deterministic> max_steps=<M>`
+     - `[STEP] task=<TASK> episode=<N> step=<K> action=<ACTION> patient_id=<ID|None> reward=<FLOAT> done=<true|false> status=<STATUS>`
+     - `[END] task=<TASK> episode=<N> seed=<SEED> score=<FLOAT> steps=<COUNT> done=<true|false>`
+   - Use `print(..., flush=True)`.
 
 ### Validation Gates
 
