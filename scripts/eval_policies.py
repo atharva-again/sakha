@@ -117,7 +117,9 @@ def main() -> None:
 
     print(json.dumps(output, indent=2))
     if args.output_json:
-        Path(args.output_json).write_text(json.dumps(output, indent=2) + "\n")
+        output_path = Path(args.output_json)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_text(json.dumps(output, indent=2) + "\n")
     sys.exit(0)
 
 
