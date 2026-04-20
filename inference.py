@@ -509,7 +509,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Sakha baseline inference")
     parser.add_argument("--tasks", default="easy,medium,hard", help="Comma-separated task names")
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
-    parser.add_argument("--episodes", type=int, default=3, help="Episodes per task")
+    parser.add_argument("--episodes", type=int, default=1, help="Episodes per task")
     parser.add_argument(
         "--max-steps",
         type=int,
