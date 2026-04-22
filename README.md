@@ -38,11 +38,11 @@ The interactive playground lets you step through a full 8-hour ward shift.
 
 In Indian hospitals, a single nurse or ward attendant may handle a large patient load with routine care, deterioration events, admissions, discharge prep, and repeated bedside rounding happening in the same shift. **Sakha** is a deterministic OpenEnv benchmark for evaluating whether an agent can manage that workflow under time pressure.
 
-Sakha is intentionally positioned as an **evaluation environment**:
+Sakha provides:
 
-- it provides the environment, rewards, and graders
-- it includes baseline inference and scripted policy evaluation
-- it does **not** include a full RL training or policy-learning stack
+- the environment, rewards, and graders
+- baseline inference and scripted policy evaluation
+- a minimal GRPO training script and Colab notebook for fine-tuning LLM policies
 
 See https://github.com/atharva-again/sakha/blob/main/docs/benchmark_spec.md for the benchmark definition.
 
@@ -121,6 +121,15 @@ uv run python scripts/eval_policies.py --task hard --seed 42 --episodes 20 --pol
 ```bash
 uv run python scripts/eval_policies.py --task hard --seed 42 --episodes 10 --all-policies --output-json hard_seed_sweep.json
 ```
+
+### Run GRPO training (local)
+```bash
+uv run python scripts/train_grpo.py --mode smoke
+uv run python scripts/train_grpo.py --mode demo --task hard --episodes 200
+```
+
+### Open the Colab notebook
+Open `notebooks/sakha_grpo_training.ipynb` in Google Colab for a GPU-backed training run.
 
 ### Docker
 ```bash

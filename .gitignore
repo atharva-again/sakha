@@ -6,3 +6,5 @@ __pycache__/
 .ruff_cache/
 .sisyphus/*
 artifacts/
+grpo_output/
+output.md
