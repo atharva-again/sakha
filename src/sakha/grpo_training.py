@@ -1,0 +1,211 @@
+"""Utilities for state-aligned GRPO training examples and rewards."""
+
+from __future__ import annotations
+
+import json
+import re
+from typing import Any
+
+from sakha.env import SakhaEnvironment
+from sakha.models import ActionType, SakhaAction, SakhaObservation
+
+ACTION_NAME_MAP = {
+    "review_patient": ActionType.REVIEW_PATIENT,
+    "check_vitals": ActionType.CHECK_VITALS,
+    "administer_medicine": ActionType.ADMINISTER_MEDICINE,
+    "alert_doctor": ActionType.ALERT_DOCTOR,
+    "escalate": ActionType.ESCALATE,
+    "update_chart": ActionType.UPDATE_CHART,
+    "prepare_discharge": ActionType.PREPARE_DISCHARGE,
+    "medication_round": ActionType.MEDICATION_ROUND,
+    "ward_sweep": ActionType.WARD_SWEEP,
+    "noop": ActionType.NOOP,
+}
+
+DEFAULT_STATE_STEPS = (0, 4, 8, 16, 32, 48, 64, 80)
+ACTION_RE = re.compile(r"([a-zA-Z_]+)\s*\(\s*(\d+)?\s*\)")
+
+
+def parse_action_response_with_status(response: str) -> tuple[SakhaAction, bool]:
+    """Parse the first valid Sakha action call and report whether parsing succeeded."""
+    response = response.strip().lower()
+    match = ACTION_RE.search(response)
+    if match:
+        name = match.group(1)
+        patient_id = int(match.group(2)) if match.group(2) else None
+        if name in ACTION_NAME_MAP:
+            return SakhaAction(action_type=ACTION_NAME_MAP[name], patient_id=patient_id), True
+    return SakhaAction(action_type=ActionType.NOOP, patient_id=None), False
+
+
+def parse_action_response(response: str) -> SakhaAction:
+    """Backward-compatible parser used by eval code."""
+    action, _ = parse_action_response_with_status(response)
+    return action
+
+
+def action_to_replay_dict(action: SakhaAction) -> dict[str, Any]:
+    return {
+        "action_type": action.action_type.value,
+        "patient_id": action.patient_id,
+        "medicine_id": action.medicine_id,
+        "reason_code": action.reason_code,
+    }
+
+
+def action_from_replay_dict(payload: dict[str, Any]) -> SakhaAction:
+    return SakhaAction(
+        action_type=payload["action_type"],
+        patient_id=payload.get("patient_id"),
+        medicine_id=payload.get("medicine_id"),
+        reason_code=payload.get("reason_code"),
+    )
+
+
+def choose_queue_head_action(obs: SakhaObservation) -> SakhaAction:
+    """Simple deterministic policy used only to reach varied training states."""
+    if not obs.ward_state.pending_tasks:
+        return SakhaAction(action_type=ActionType.NOOP, patient_id=None)
+    task = obs.ward_state.pending_tasks[0]
+    return SakhaAction(action_type=task.required_action, patient_id=task.patient_id)
+
+
+def build_grpo_prompt(obs: SakhaObservation, *, task: str, episode_id: int) -> list[dict[str, str]]:
+    pending = obs.ward_state.pending_tasks[:8] if obs.ward_state.pending_tasks else []
+    tasks_str = "\n".join(
+        (
+            f"- {task_obj.required_action.value}"
+            f"({task_obj.patient_id if task_obj.patient_id is not None else ''})"
+            f" priority={task_obj.priority} due_step={task_obj.due_step}"
+            f" summary={task_obj.summary}"
+        )
+        for task_obj in pending
+    ) or "- No pending tasks"
+
+    active_incidents = [
+        patient
+        for patient in obs.ward_state.patients
+        if patient.active_incident_id >= 0 and not patient.discharge_prepared
+    ]
+    incidents_str = "\n".join(
+        (
+            f"- patient={patient.bed_id} checked={patient.incident_checked} "
+            f"alerted={patient.incident_alerted} escalated={patient.incident_escalated} "
+            f"deadline_step={patient.incident_deadline_step}"
+        )
+        for patient in active_incidents[:5]
+    ) or "- None"
+
+    due_meds = [
+        patient.bed_id
+        for patient in obs.ward_state.patients
+        if patient.medications_due and not patient.discharge_prepared
+    ]
+    due_vitals = [
+        patient.bed_id
+        for patient in obs.ward_state.patients
+        if patient.vitals_due and not patient.discharge_prepared
+    ]
+
+    system_msg = (
+        "You are a hospital ward assistant managing patients through a shift. "
+        "Think through priorities, then answer with exactly one action call.\n\n"
+        "Valid actions: review_patient(patient_id), check_vitals(patient_id), "
+        "administer_medicine(patient_id), alert_doctor(patient_id), escalate(patient_id), "
+        "update_chart(patient_id), prepare_discharge(patient_id), medication_round(), "
+        "ward_sweep(), noop().\n"
+        "Return only the final action call, for example: check_vitals(3)"
+    )
+
+    user_msg = (
+        f"Task difficulty: {task}\n"
+        f"Episode: {episode_id}\n"
+        f"Current step: {obs.ward_state.current_step}\n"
+        f"Patients: {len(obs.ward_state.patients)}\n"
+        f"Pending task count: {obs.pending_count}\n"
+        f"Medication due patient IDs: {due_meds or 'none'}\n"
+        f"Vitals due patient IDs: {due_vitals or 'none'}\n\n"
+        f"Priority pending tasks:\n{tasks_str}\n\n"
+        f"Active incidents:\n{incidents_str}\n\n"
+        "What is the next best action?"
+    )
+    return [
+        {"role": "system", "content": system_msg},
+        {"role": "user", "content": user_msg},
+    ]
+
+
+def build_state_aligned_examples(
+    *,
+    task: str,
+    episodes: int,
+    seed: int,
+    max_steps: int,
+    state_steps: tuple[int, ...] = DEFAULT_STATE_STEPS,
+) -> dict[str, list[Any]]:
+    examples: dict[str, list[Any]] = {
+        "prompt": [],
+        "seed": [],
+        "target_step": [],
+        "replay_actions_json": [],
+    }
+
+    for episode_id in range(episodes):
+        episode_seed = seed + episode_id
+        target_step = min(state_steps[episode_id % len(state_steps)], max(0, max_steps - 1))
+        env = SakhaEnvironment(task=task)
+        obs = env.reset(seed=episode_seed)
+        replay_actions: list[dict[str, Any]] = []
+
+        for _ in range(target_step):
+            if obs.done:
+                break
+            action = choose_queue_head_action(obs)
+            replay_actions.append(action_to_replay_dict(action))
+            obs = env.step(action)
+
+        examples["prompt"].append(build_grpo_prompt(obs, task=task, episode_id=episode_id))
+        examples["seed"].append(episode_seed)
+        examples["target_step"].append(obs.ward_state.current_step)
+        examples["replay_actions_json"].append(json.dumps(replay_actions))
+
+    return examples
+
+
+def reconstruct_env_state(
+    *, task: str, seed: int, replay_actions_json: str
+) -> tuple[SakhaEnvironment, SakhaObservation]:
+    env = SakhaEnvironment(task=task)
+    obs = env.reset(seed=seed)
+    for payload in json.loads(replay_actions_json or "[]"):
+        obs = env.step(action_from_replay_dict(payload))
+        if obs.done:
+            break
+    return env, obs
+
+
+def score_completion_action(
+    completion: str,
+    *,
+    task: str,
+    seed: int,
+    replay_actions_json: str,
+    parse_failure_reward: float = -0.2,
+    env_reward_scale: float = 10.0,
+    format_bonus: float = 0.02,
+) -> float:
+    action, parsed_ok = parse_action_response_with_status(completion)
+    if not parsed_ok:
+        return parse_failure_reward
+
+    try:
+        env, obs = reconstruct_env_state(
+            task=task, seed=seed, replay_actions_json=replay_actions_json
+        )
+        if obs.done:
+            return parse_failure_reward
+        scored_obs = env.step(action)
+    except Exception:
+        return parse_failure_reward
+
+    return float((scored_obs.reward or 0.0) * env_reward_scale + format_bonus)

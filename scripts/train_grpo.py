@@ -7,7 +7,6 @@ Install compatible dependencies (Colab):
     pip install --upgrade --force-reinstall --no-deps unsloth unsloth_zoo
 """
 
-import sys
 import os
 
 # Prevent vLLM from reconfiguring logging (crashes Jupyter/Colab's OutStream)
@@ -17,13 +16,18 @@ import re
 import json
 import gc
 import torch
-import random
 import matplotlib.pyplot as plt
 from pathlib import Path
 from datasets import Dataset
 from tqdm import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from sakha.env import SakhaEnvironment
+from sakha.grpo_training import (
+    ACTION_NAME_MAP,
+    build_grpo_prompt,
+    build_state_aligned_examples,
+    score_completion_action,
+)
 from sakha.models import SakhaAction, ActionType
 from sakha.graders import score_easy_task, score_medium_task, score_hard_task
 
@@ -58,133 +62,43 @@ print(f"  Max steps: {MAX_STEPS}")
 print(f"  Use Unsloth: {USE_UNSLOTH}")
 print(f"  4-bit quant: {LOAD_IN_4BIT}")
 
-# ============================================================
-# Notebook Cell: 4. Define Environment Wrapper for TRL
-# ============================================================
+def _completion_text(completion):
+    if isinstance(completion, list):
+        return str(completion[-1]["content"])
+    return str(completion)
 
-class SakhaEnvWrapper:
-    """Environment wrapper for TRL's GRPOTrainer."""
 
-    def __init__(self, task: str = "hard", seed: int | None = None):
-        self.task = task
-        self.seed = seed
-        self.env = SakhaEnvironment(task=task)
-        self.reward = 0.0
-        self._action_type = ActionType
-        self._episode_reward = 0.0
-        self._episode_steps = 0
+def _metadata_value(values, completion_idx: int, completion_count: int, default):
+    """Select metadata whether TRL passes it per prompt or per generation."""
+    if values is None:
+        return default
+    if not isinstance(values, (list, tuple)):
+        return values
+    if len(values) == completion_count:
+        return values[completion_idx]
+    if len(values) == 1:
+        return values[0]
+    prompt_idx = min(completion_idx // NUM_GENERATIONS, len(values) - 1)
+    return values[prompt_idx]
 
-    def reset(self, **kwargs) -> str:
-        """Reset the environment."""
-        if self.seed is not None:
-            import random
-            random.seed(self.seed)
-        obs = self.env.reset()
-        self.reward = 0.0
-        self._episode_reward = 0.0
-        self._episode_steps = 0
-        return self._format_observation(obs)
-
-    def _format_observation(self, obs) -> str:
-        """Format observation as string for tool result."""
-        pending = obs.ward_state.pending_tasks[:5] if obs.ward_state.pending_tasks else []
-        tasks_str = ", ".join(f"{t.required_action}({t.patient_id})" for t in pending) or "No pending tasks"
-        return (
-            f"Step {obs.ward_state.current_step}, "
-            f"Patients: {len(obs.ward_state.patients)}, "
-            f"Pending: {obs.pending_count}, "
-            f"Tasks: {tasks_str}"
-        )
-
-    def _step(self, action) -> str:
-        """Execute action and track metrics."""
-        obs = self.env.step(action)
-        self.reward = obs.reward or 0.0
-        self._episode_reward += self.reward
-        self._episode_steps += 1
-        return obs
-
-    def review_patient(self, patient_id: int) -> str:
-        """Review patient at bed ID."""
-        action = SakhaAction(action_type=self._action_type.REVIEW_PATIENT, patient_id=patient_id)
-        obs = self._step(action)
-        return self._format_observation(obs)
-
-    def administer_medicine(self, patient_id: int) -> str:
-        """Administer medication to patient."""
-        action = SakhaAction(action_type=self._action_type.ADMINISTER_MEDICINE, patient_id=patient_id)
-        obs = self._step(action)
-        detail = obs.action_result.detail if obs.action_result else ""
-        return f"{self._format_observation(obs)} | {detail}"
-
-    def check_vitals(self, patient_id: int) -> str:
-        """Check vitals for patient."""
-        action = SakhaAction(action_type=self._action_type.CHECK_VITALS, patient_id=patient_id)
-        obs = self._step(action)
-        return self._format_observation(obs)
-
-    def alert_doctor(self, patient_id: int) -> str:
-        """Alert doctor for patient."""
-        action = SakhaAction(action_type=self._action_type.ALERT_DOCTOR, patient_id=patient_id)
-        obs = self._step(action)
-        return self._format_observation(obs)
-
-    def escalate(self, patient_id: int) -> str:
-        """Escalate patient incident."""
-        action = SakhaAction(action_type=self._action_type.ESCALATE, patient_id=patient_id)
-        obs = self._step(action)
-        return self._format_observation(obs)
-
-    def update_chart(self, patient_id: int) -> str:
-        """Update patient chart."""
-        action = SakhaAction(action_type=self._action_type.UPDATE_CHART, patient_id=patient_id)
-        obs = self._step(action)
-        return self._format_observation(obs)
-
-    def prepare_discharge(self, patient_id: int) -> str:
-        """Prepare patient for discharge."""
-        action = SakhaAction(action_type=self._action_type.PREPARE_DISCHARGE, patient_id=patient_id)
-        obs = self._step(action)
-        return self._format_observation(obs)
-
-    def medication_round(self) -> str:
-        """Complete medication round for all patients with due medications."""
-        action = SakhaAction(action_type=self._action_type.MEDICATION_ROUND, patient_id=None)
-        obs = self._step(action)
-        detail = obs.action_result.detail if obs.action_result else ""
-        return f"{self._format_observation(obs)} | {detail}"
-
-    def ward_sweep(self) -> str:
-        """Complete ward sweep and coordination check."""
-        action = SakhaAction(action_type=self._action_type.WARD_SWEEP, patient_id=None)
-        obs = self._step(action)
-        return self._format_observation(obs)
-
-    def noop(self) -> str:
-        """Take no action (pass time)."""
-        action = SakhaAction(action_type=self._action_type.NOOP, patient_id=None)
-        obs = self._step(action)
-        return self._format_observation(obs)
-
-    def get_metrics(self):
-        """Return accumulated episode metrics."""
-        return {
-            "episode_reward": self._episode_reward,
-            "episode_steps": self._episode_steps,
-        }
 
 def reward_func(prompts, completions, **kwargs):
-    """Reward function for GRPO. TRL passes prompts and completions as kwargs."""
+    """State-aligned reward: parse the action, reconstruct prompt state, step once."""
     rewards = []
-    for completion in completions:
-        content = completion[-1]["content"] if isinstance(completion, list) else completion
-        content = str(content).strip().lower()
-        # Reward action-like responses, penalize empty/nonsense
-        match = re.search(r"(\w+)\s*\(\s*(\d+)?\s*\)", content)
-        if match and match.group(1) in ACTION_NAME_MAP:
-            rewards.append(1.0)
-        else:
-            rewards.append(-1.0)
+    completion_count = len(completions)
+    for idx, completion in enumerate(completions):
+        seed = int(_metadata_value(kwargs.get("seed"), idx, completion_count, SEED))
+        replay_actions_json = _metadata_value(
+            kwargs.get("replay_actions_json"), idx, completion_count, "[]"
+        )
+        rewards.append(
+            score_completion_action(
+                _completion_text(completion),
+                task=TASK,
+                seed=seed,
+                replay_actions_json=str(replay_actions_json),
+            )
+        )
     return rewards
 
 # ============================================================
@@ -192,24 +106,18 @@ def reward_func(prompts, completions, **kwargs):
 # ============================================================
 
 def create_prompt(task: str, episode_id: int = 0):
-    system_msg = (
-        "You are a hospital ward assistant managing patients. "
-        "Available actions: review_patient(patient_id), check_vitals(patient_id), "
-        "administer_medicine(patient_id), alert_doctor(patient_id), escalate(patient_id), "
-        "update_chart(patient_id), prepare_discharge(patient_id), medication_round(), "
-        "ward_sweep(), noop(). "
-        f"Task difficulty: {task}. "
-        f"Episode: {episode_id}. "
-        "Choose the best action based on pending tasks and patient needs."
-    )
-    return [
-        {"role": "system", "content": system_msg},
-        {"role": "user", "content": "Begin your shift. Review the ward and decide your first action."}
-    ]
+    env = SakhaEnvironment(task=task)
+    obs = env.reset(seed=SEED + episode_id)
+    return build_grpo_prompt(obs, task=task, episode_id=episode_id)
 
 # Build dataset
-prompts = [create_prompt(TASK, i) for i in range(EPISODES)]
-dataset = Dataset.from_dict({"prompt": prompts})
+training_examples = build_state_aligned_examples(
+    task=TASK,
+    episodes=EPISODES,
+    seed=SEED,
+    max_steps=MAX_STEPS,
+)
+dataset = Dataset.from_dict(training_examples)
 
 print(f"Dataset size: {len(dataset)} prompts")
 
@@ -217,20 +125,6 @@ print(f"Dataset size: {len(dataset)} prompts")
 # Notebook Cell: 6. Pre-Training Evaluation — Base LLM
 # ============================================================
 # RUN THIS FIRST to avoid Unsloth monkey-patch conflict
-
-# Action name mapping for eval
-ACTION_NAME_MAP = {
-    "review_patient": ActionType.REVIEW_PATIENT,
-    "check_vitals": ActionType.CHECK_VITALS,
-    "administer_medicine": ActionType.ADMINISTER_MEDICINE,
-    "alert_doctor": ActionType.ALERT_DOCTOR,
-    "escalate": ActionType.ESCALATE,
-    "update_chart": ActionType.UPDATE_CHART,
-    "prepare_discharge": ActionType.PREPARE_DISCHARGE,
-    "medication_round": ActionType.MEDICATION_ROUND,
-    "ward_sweep": ActionType.WARD_SWEEP,
-    "noop": ActionType.NOOP,
-}
 
 SYSTEM_PROMPT = (
     "You are a hospital ward assistant managing patients. "
@@ -497,7 +391,6 @@ trainer_kwargs = {
     "train_dataset": dataset,
     "reward_funcs": reward_func,
     "args": grpo_config,
-    "environment_factory": lambda: SakhaEnvWrapper(task=TASK, seed=SEED),
 }
 
 if USE_UNSLOTH:
