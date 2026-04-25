@@ -20,7 +20,7 @@ The interactive playground lets you step through a full 8-hour ward shift.
    - `escalation_level`: active critical state.
    - `last_vitals`: only visible after recent bedside contact or active deterioration.
 3. **Act**: Fill the action fields and click **Step** (each action takes 5 minutes):
-   - **Action Type**: One of `review_patient`, `administer_medicine`, `check_vitals`, `alert_doctor`, `escalate`, `document_findings`, `prepare_discharge`, or `noop`.
+    - **Action Type**: One of `review_patient`, `administer_medicine`, `check_vitals`, `alert_doctor`, `escalate`, `update_chart`, `ward_sweep`, `medication_round`, `prepare_discharge`, or `noop`.
    - **Patient Id**: The bed number (e.g. `1`, `2`, up to `18`).
    - **Medicine Id**: (Optional) The name of the medicine being given.
    - **Reason Code**: (Optional) Use this when escalating or documenting a decision trail.
@@ -50,7 +50,7 @@ See https://github.com/atharva-again/sakha/blob/main/docs/benchmark_spec.md for 
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `action_type` | `str` | One of: `review_patient`, `administer_medicine`, `check_vitals`, `alert_doctor`, `escalate`, `document_findings`, `prepare_discharge`, `noop` |
+| `action_type` | `str` | One of: `review_patient`, `administer_medicine`, `check_vitals`, `alert_doctor`, `escalate`, `update_chart`, `ward_sweep`, `medication_round`, `prepare_discharge`, `noop` |
 | `patient_id` | `int \| None` | Target bed ID (1-indexed) |
 | `medicine_id` | `str \| None` | Optional medicine identifier |
 | `reason_code` | `str \| None` | Optional justification string for escalation or documentation |
@@ -86,6 +86,30 @@ Manage 18 patients with repeated routine work, 5 deterioration events, admission
 - **Capability**: sustained coordination under concurrent pressure instead of one-off crisis clicks
 
 For benchmark intent, expected failure modes, and interpretation guidance, see https://github.com/atharva-again/sakha/blob/main/docs/benchmark_spec.md.
+
+## Results
+
+LLMs fail at sustained prioritization under load; Sakha is the first benchmark that measures that in a high-stakes professional setting.
+
+### Before vs After
+
+| Task | Baseline Score | Trained Score | Δ |
+|---|---|---|---|
+| Easy | 0.8048 | TBD | TBD |
+| Medium | 0.4905 | TBD | TBD |
+| Hard | 0.3147 | TBD | TBD |
+
+*Trained scores require GPU training (Colab T4 or HF Spaces). Run `notebooks/sakha_grpo_training.ipynb` for full training.*
+
+### Training Evidence
+
+![Training Reward Curve](artifacts/plots/reward_curve.png)
+
+![Before vs After](artifacts/plots/before_after.png)
+
+### Why It Matters
+
+Hospital wards in India run on sustained coordination, not one-off decisions. Sakha measures whether an agent can maintain discipline across a full 8-hour shift with concurrent routine work, admissions, deterioration events, and discharge prep. The baseline scores show that even a deterministic priority policy struggles on hard tasks, leaving ample headroom for learned policies to improve.
 
 ## Setup
 
@@ -143,9 +167,9 @@ These are benchmark reference scores, not claims of optimal policy quality.
 
 | Task | Policy | Mean Score |
 |------|--------|------------|
-| Easy | deterministic queue policy | 0.4735 |
-| Medium | deterministic queue policy | 0.3542 |
-| Hard | deterministic queue policy | 0.2195 |
+| Easy | deterministic queue policy | 0.8048 |
+| Medium | deterministic queue policy | 0.4905 |
+| Hard | deterministic queue policy | 0.3147 |
 
 ## Reward Design
 
@@ -157,7 +181,7 @@ These are benchmark reference scores, not claims of optimal policy quality.
 ## Safety Constraints
 
 - Critical incidents are designed as workflow problems, not diagnosis problems
-- Escalation alone is insufficient; the intended workflow is `check_vitals -> alert_doctor -> escalate -> document_findings`
+- Escalation alone is insufficient; the intended workflow is `check_vitals -> alert_doctor -> escalate -> update_chart`
 - No diagnosis or treatment recommendations — attendant-assist only
 
 ## What This Repository Is
