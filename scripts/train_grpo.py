@@ -49,6 +49,7 @@ LOAD_IN_4BIT = True                  # 4-bit quantization (critical for T4)
 NUM_GENERATIONS = 4                  # Responses per prompt
 LEARNING_RATE = 1e-5                 # Learning rate
 MAX_COMPLETION_LENGTH = 512          # Max tokens per completion
+MAX_SEQ_LENGTH = 2048                # Prompt + completion context for vLLM/Unsloth
 
 # Checkpoint directory
 CHECKPOINT_DIR = Path("./grpo_output")
@@ -59,6 +60,7 @@ print(f"  Model: {MODEL}")
 print(f"  Task: {TASK}")
 print(f"  Episodes: {EPISODES}")
 print(f"  Max steps: {MAX_STEPS}")
+print(f"  Max sequence length: {MAX_SEQ_LENGTH}")
 print(f"  Use Unsloth: {USE_UNSLOTH}")
 print(f"  4-bit quant: {LOAD_IN_4BIT}")
 
@@ -339,10 +341,10 @@ if USE_UNSLOTH:
 
     model, tokenizer = FastLanguageModel.from_pretrained(
         model_name=MODEL,
-        max_seq_length=MAX_COMPLETION_LENGTH,
+        max_seq_length=MAX_SEQ_LENGTH,
         load_in_4bit=LOAD_IN_4BIT,
         fast_inference=True,
-        gpu_memory_utilization=0.7,
+        gpu_memory_utilization=0.6,
     )
 
     model = FastLanguageModel.get_peft_model(
@@ -424,10 +426,10 @@ if trained_results is None:
             from unsloth import FastLanguageModel
             trained_model, trained_tokenizer = FastLanguageModel.from_pretrained(
                 model_name=CHECKPOINT_PATH,
-                max_seq_length=MAX_COMPLETION_LENGTH,
+                max_seq_length=MAX_SEQ_LENGTH,
                 load_in_4bit=LOAD_IN_4BIT,
                 fast_inference=True,
-                gpu_memory_utilization=0.7,
+                gpu_memory_utilization=0.6,
             )
             FastLanguageModel.for_inference(trained_model)
         else:

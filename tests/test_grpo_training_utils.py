@@ -35,7 +35,7 @@ def test_state_aligned_example_reconstructs_prompt_step():
     )
 
     assert obs.ward_state.current_step == examples["target_step"][0]
-    assert f"Current step: {obs.ward_state.current_step}" in examples["prompt"][0][1]["content"]
+    assert f"step={obs.ward_state.current_step}" in examples["prompt"][0][1]["content"]
 
 
 def test_state_aligned_reward_has_action_variance():

@@ -71,13 +71,12 @@ def choose_queue_head_action(obs: SakhaObservation) -> SakhaAction:
 
 
 def build_grpo_prompt(obs: SakhaObservation, *, task: str, episode_id: int) -> list[dict[str, str]]:
-    pending = obs.ward_state.pending_tasks[:8] if obs.ward_state.pending_tasks else []
+    pending = obs.ward_state.pending_tasks[:5] if obs.ward_state.pending_tasks else []
     tasks_str = "\n".join(
         (
             f"- {task_obj.required_action.value}"
             f"({task_obj.patient_id if task_obj.patient_id is not None else ''})"
-            f" priority={task_obj.priority} due_step={task_obj.due_step}"
-            f" summary={task_obj.summary}"
+            f" p={task_obj.priority} due={task_obj.due_step}"
         )
         for task_obj in pending
     ) or "- No pending tasks"
@@ -89,11 +88,11 @@ def build_grpo_prompt(obs: SakhaObservation, *, task: str, episode_id: int) -> l
     ]
     incidents_str = "\n".join(
         (
-            f"- patient={patient.bed_id} checked={patient.incident_checked} "
+            f"- pt={patient.bed_id} checked={patient.incident_checked} "
             f"alerted={patient.incident_alerted} escalated={patient.incident_escalated} "
-            f"deadline_step={patient.incident_deadline_step}"
+            f"deadline={patient.incident_deadline_step}"
         )
-        for patient in active_incidents[:5]
+        for patient in active_incidents[:3]
     ) or "- None"
 
     due_meds = [
@@ -108,26 +107,20 @@ def build_grpo_prompt(obs: SakhaObservation, *, task: str, episode_id: int) -> l
     ]
 
     system_msg = (
-        "You are a hospital ward assistant managing patients through a shift. "
-        "Think through priorities, then answer with exactly one action call.\n\n"
-        "Valid actions: review_patient(patient_id), check_vitals(patient_id), "
-        "administer_medicine(patient_id), alert_doctor(patient_id), escalate(patient_id), "
-        "update_chart(patient_id), prepare_discharge(patient_id), medication_round(), "
-        "ward_sweep(), noop().\n"
-        "Return only the final action call, for example: check_vitals(3)"
+        "You are a hospital ward assistant. Return exactly one action call.\n"
+        "Actions: review_patient(id), check_vitals(id), administer_medicine(id), "
+        "alert_doctor(id), escalate(id), update_chart(id), prepare_discharge(id), "
+        "medication_round(), ward_sweep(), noop()."
     )
 
     user_msg = (
-        f"Task difficulty: {task}\n"
-        f"Episode: {episode_id}\n"
-        f"Current step: {obs.ward_state.current_step}\n"
-        f"Patients: {len(obs.ward_state.patients)}\n"
-        f"Pending task count: {obs.pending_count}\n"
-        f"Medication due patient IDs: {due_meds or 'none'}\n"
-        f"Vitals due patient IDs: {due_vitals or 'none'}\n\n"
-        f"Priority pending tasks:\n{tasks_str}\n\n"
-        f"Active incidents:\n{incidents_str}\n\n"
-        "What is the next best action?"
+        f"Task={task} episode={episode_id} step={obs.ward_state.current_step} "
+        f"patients={len(obs.ward_state.patients)} pending={obs.pending_count}\n"
+        f"meds_due={due_meds or 'none'}\n"
+        f"vitals_due={due_vitals or 'none'}\n"
+        f"pending_tasks:\n{tasks_str}\n"
+        f"active_incidents:\n{incidents_str}\n"
+        "Next action:"
     )
     return [
         {"role": "system", "content": system_msg},
