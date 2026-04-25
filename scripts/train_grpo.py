@@ -351,6 +351,18 @@ def main():
         action="store_true",
         help="Resume from latest checkpoint in output-dir",
     )
+    parser.add_argument(
+        "--learning-rate",
+        type=float,
+        default=1e-5,
+        help="Learning rate for GRPO training (default: 1e-5)",
+    )
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=4,
+        help="Per-device batch size for training (default: 4)",
+    )
     args = parser.parse_args()
 
     preset = MODE_PRESETS[args.mode]
@@ -384,6 +396,8 @@ def main():
         "episodes": episodes,
         "max_steps": args.max_steps,
         "seed": args.seed,
+        "learning_rate": args.learning_rate,
+        "batch_size": args.batch_size,
         "eval_fraction": eval_fraction,
         "git_sha": get_git_sha(),
         "timestamp": timestamp,
@@ -402,9 +416,9 @@ def main():
         num_train_epochs=1,
         num_generations=4,
         max_completion_length=512,
-        learning_rate=1e-5,
+        learning_rate=args.learning_rate,
         logging_steps=preset["logging_steps"],
-        per_device_train_batch_size=4,
+        per_device_train_batch_size=args.batch_size,
         gradient_accumulation_steps=1,
         save_strategy=preset["save_strategy"],
         save_steps=preset.get("save_steps", 500),
