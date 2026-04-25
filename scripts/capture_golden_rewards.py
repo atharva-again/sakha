@@ -5,22 +5,9 @@ import sys
 from pathlib import Path
 
 from sakha.env import SakhaEnvironment
-from sakha.graders import score_easy_task, score_hard_task, score_medium_task
 from sakha.models import SakhaAction
 
-TASK_GRADERS = {
-    "easy": score_easy_task,
-    "medium": score_medium_task,
-    "hard": score_hard_task,
-}
-PATIENT_COUNTS = {"easy": 5, "medium": 8, "hard": 18}
-
-
-def priority_policy(obs, step, pc):
-    if obs.ward_state.pending_tasks:
-        task = obs.ward_state.pending_tasks[0]
-        return SakhaAction(action_type=task.required_action, patient_id=task.patient_id)
-    return SakhaAction(action_type="noop", patient_id=None)
+from scripts.eval_common import PATIENT_COUNTS, TASK_GRADERS, priority_policy
 
 
 def capture_fixtures(task: str, seed: int, episodes: int, max_steps: int = 96) -> dict:
