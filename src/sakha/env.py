@@ -19,6 +19,12 @@ from sakha.models import (
     Vitals,
     WardState,
 )
+from sakha.rubrics import (
+    SakhaRubric,
+    _compute_critical_incident_reward,
+    _compute_deadline_penalty,
+    _compute_routine_care_reward,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -170,6 +176,7 @@ class SakhaEnvironment(Environment[SakhaAction, SakhaObservation, SakhaState]):
         self._last_ward_sweep_step = -int(
             config.get("ward_sweep_cooldown_steps", DEFAULT_WARD_SWEEP_COOLDOWN_STEPS)
         )
+        self.rubric = SakhaRubric()
 
     def reset(
         self, seed: int | None = None, episode_id: str | None = None, **kwargs
@@ -185,6 +192,7 @@ class SakhaEnvironment(Environment[SakhaAction, SakhaObservation, SakhaState]):
         self._last_ward_sweep_step = -int(
             config.get("ward_sweep_cooldown_steps", DEFAULT_WARD_SWEEP_COOLDOWN_STEPS)
         )
+        self._reset_rubric()
 
         patients = [self._make_patient(bed_id=index + 1) for index in range(self._patient_count)]
         self._ward = WardState(
@@ -216,19 +224,40 @@ class SakhaEnvironment(Environment[SakhaAction, SakhaObservation, SakhaState]):
         self._trigger_events()
         self._materialize_due_work()
 
-        action_result, reward = self._process_action(action)
-        reward += self._apply_deadline_penalties(action)
+        done = self._state.step_count >= SHIFT_STEPS
+        truncated = done
+
+        # Build pre-action observation so the rubric can compute reward
+        # from the exact state before mutations.
+        pre_obs = self._build_observation(
+            done=done,
+            truncated=truncated,
+            reward=None,
+            action_result=None,
+        )
+        pre_obs.metadata["_last_ward_sweep_step"] = self._last_ward_sweep_step
+        pre_obs.metadata["_task_config"] = self._task_config
+        self._pre_action_obs = pre_obs
+
+        action_result, _ = self._process_action(action)
+        _ = self._apply_deadline_penalties(action)
         self._materialize_due_work()
         self._update_metrics_step()
 
-        done = self._state.step_count >= SHIFT_STEPS
-        truncated = done
-        return self._build_observation(
+        obs = self._build_observation(
             done=done,
             truncated=truncated,
-            reward=round(reward, 4),
+            reward=None,
             action_result=action_result,
         )
+        reward = self._apply_rubric(action, obs)
+        obs.reward = round(reward, 4)
+        return obs
+
+    def _apply_rubric(self, action, observation):
+        if self.rubric is not None and hasattr(self, "_pre_action_obs"):
+            return self.rubric(action, self._pre_action_obs)
+        return super()._apply_rubric(action, observation)
 
     def _make_patient(self, bed_id: int) -> PatientState:
         profile = DIAGNOSIS_PROFILES[(bed_id - 1) % len(DIAGNOSIS_PROFILES)]
@@ -341,9 +370,20 @@ class SakhaEnvironment(Environment[SakhaAction, SakhaObservation, SakhaState]):
         return next((p for p in self._ward.patients if p.bed_id == patient_id), None)
 
     def _process_action(self, action: SakhaAction) -> tuple[ActionResult, float]:
+        pre_reward = _compute_routine_care_reward(
+            action,
+            self._state.step_count,
+            self._ward.patients,
+            self._last_ward_sweep_step,
+            self._task_config,
+        ) + _compute_critical_incident_reward(action, self._state.step_count, self._ward.patients)
+
         if action.action_type == ActionType.NOOP:
             self._episode_metrics.noop_steps += 1
-            return ActionResult(status="no_effect", detail="Shift time passed without action"), 0.0
+            return ActionResult(
+                status="no_effect", detail="Shift time passed without action"
+            ), pre_reward
+
         if action.action_type == ActionType.MEDICATION_ROUND:
             due_patients = sorted(
                 self._patients_with_due_medications(),
@@ -357,8 +397,7 @@ class SakhaEnvironment(Environment[SakhaAction, SakhaObservation, SakhaState]):
                 return ActionResult(
                     status="no_effect",
                     detail="No medication round due right now",
-                ), -0.01
-            reward = 0.0
+                ), pre_reward
             total_administered = 0
             for patient in due_patients:
                 total_administered += len(patient.medications_due)
@@ -373,9 +412,6 @@ class SakhaEnvironment(Environment[SakhaAction, SakhaObservation, SakhaState]):
                 ):
                     patient.medication_tasks_on_time += 1
                     self._episode_metrics.medication_tasks_on_time += 1
-                    reward += 0.06
-                else:
-                    reward += 0.02
                 patient.medication_due_by_step = -1
                 patient.medication_overdue_counted = False
                 next_step = self._state.step_count + patient.medication_interval_steps
@@ -383,14 +419,15 @@ class SakhaEnvironment(Environment[SakhaAction, SakhaObservation, SakhaState]):
             return ActionResult(
                 status="success",
                 detail=f"Completed medication round for {len(due_patients)} patients ({total_administered} meds)",
-            ), reward
+            ), pre_reward
+
         if action.action_type == ActionType.WARD_SWEEP:
             if self._has_pending_work():
                 self._episode_metrics.no_effect_actions += 1
                 return ActionResult(
                     status="no_effect",
                     detail="Ward sweep deferred because direct patient work is pending",
-                ), -0.005
+                ), pre_reward
             if self._state.step_count - self._last_ward_sweep_step < int(
                 self._task_config.get(
                     "ward_sweep_cooldown_steps", DEFAULT_WARD_SWEEP_COOLDOWN_STEPS
@@ -400,21 +437,22 @@ class SakhaEnvironment(Environment[SakhaAction, SakhaObservation, SakhaState]):
                 return ActionResult(
                     status="no_effect",
                     detail="Ward sweep already completed recently",
-                ), -0.002
+                ), pre_reward
             self._last_ward_sweep_step = self._state.step_count
             return ActionResult(
                 status="success",
                 detail="Completed ward sweep and coordination check",
-            ), 0.008
+            ), pre_reward
+
         patient = self._validate_patient_id(action.patient_id)
         if action.patient_id is not None and patient is None:
             self._episode_metrics.invalid_actions += 1
             return ActionResult(
                 status="invalid", detail=f"Invalid patient_id {action.patient_id}"
-            ), -0.02
+            ), pre_reward
         if patient is None:
             self._episode_metrics.invalid_actions += 1
-            return ActionResult(status="invalid", detail="Action requires patient_id"), -0.02
+            return ActionResult(status="invalid", detail="Action requires patient_id"), pre_reward
 
         if action.action_type == ActionType.REVIEW_PATIENT:
             if (
@@ -424,27 +462,24 @@ class SakhaEnvironment(Environment[SakhaAction, SakhaObservation, SakhaState]):
                 self._episode_metrics.no_effect_actions += 1
                 return ActionResult(
                     status="no_effect", detail=f"Patient {patient.bed_id} already reviewed recently"
-                ), -0.005
+                ), pre_reward
             patient.review_required = False
             patient.last_reviewed_step = self._state.step_count
             patient.reviews_completed += 1
             self._episode_metrics.reviews_completed += 1
-            reward = 0.01
             if patient.admission_review_required and not patient.admission_reviewed:
                 patient.admission_reviewed = True
-                reward = 0.03
             return ActionResult(
                 status="success", detail=f"Reviewed patient {patient.bed_id}"
-            ), reward
+            ), pre_reward
 
         if action.action_type == ActionType.ADMINISTER_MEDICINE:
             if not patient.medications_due:
                 self._episode_metrics.no_effect_actions += 1
                 return ActionResult(
                     status="no_effect", detail=f"No medication due for patient {patient.bed_id}"
-                ), -0.01
+                ), pre_reward
             medicine = patient.medications_due.pop(0)
-            reward = 0.02
             if not patient.medications_due:
                 patient.medication_tasks_completed += 1
                 self._episode_metrics.medication_tasks_completed += 1
@@ -454,38 +489,34 @@ class SakhaEnvironment(Environment[SakhaAction, SakhaObservation, SakhaState]):
                 ):
                     patient.medication_tasks_on_time += 1
                     self._episode_metrics.medication_tasks_on_time += 1
-                    reward = 0.06
                 patient.medication_due_by_step = -1
                 patient.medication_overdue_counted = False
                 next_step = self._state.step_count + patient.medication_interval_steps
                 patient.next_medication_step = next_step if next_step < SHIFT_STEPS else -1
             return ActionResult(
                 status="success", detail=f"Administered {medicine} to patient {patient.bed_id}"
-            ), reward
+            ), pre_reward
 
         if action.action_type == ActionType.CHECK_VITALS:
             if not patient.vitals_due and patient.active_incident_id < 0:
                 self._episode_metrics.no_effect_actions += 1
                 return ActionResult(
                     status="no_effect", detail=f"No vitals due for patient {patient.bed_id}"
-                ), -0.01
+                ), pre_reward
             patient.vitals_due = False
             patient.last_vitals_step = self._state.step_count
             patient.last_reviewed_step = self._state.step_count
             patient.review_required = False
             patient.vitals_tasks_completed += 1
             self._episode_metrics.vitals_tasks_completed += 1
-            reward = 0.02
             if (
                 patient.vitals_due_by_step >= 0
                 and self._state.step_count <= patient.vitals_due_by_step + VITALS_GRACE_STEPS
             ):
                 patient.vitals_tasks_on_time += 1
                 self._episode_metrics.vitals_tasks_on_time += 1
-                reward = 0.05
             if patient.active_incident_id >= 0:
                 patient.incident_checked = True
-                reward += 0.04
                 patient.last_vitals = Vitals(
                     blood_pressure_sys=86,
                     blood_pressure_dia=56,
@@ -499,7 +530,7 @@ class SakhaEnvironment(Environment[SakhaAction, SakhaObservation, SakhaState]):
             patient.next_vitals_step = next_step if next_step < SHIFT_STEPS else -1
             return ActionResult(
                 status="success", detail=f"Checked vitals for patient {patient.bed_id}"
-            ), reward
+            ), pre_reward
 
         if action.action_type == ActionType.ALERT_DOCTOR:
             if patient.active_incident_id < 0 or not patient.incident_checked:
@@ -507,13 +538,13 @@ class SakhaEnvironment(Environment[SakhaAction, SakhaObservation, SakhaState]):
                 return ActionResult(
                     status="no_effect",
                     detail=f"No assessed incident to alert for patient {patient.bed_id}",
-                ), -0.01
+                ), pre_reward
             if patient.incident_alerted:
                 self._episode_metrics.no_effect_actions += 1
                 return ActionResult(
                     status="no_effect",
                     detail=f"Doctor already alerted for patient {patient.bed_id}",
-                ), -0.005
+                ), pre_reward
             patient.incident_alerted = True
             patient.doctor_alerted = True
             patient.doctor_alert_step = self._state.step_count
@@ -521,7 +552,7 @@ class SakhaEnvironment(Environment[SakhaAction, SakhaObservation, SakhaState]):
             self._episode_metrics.doctor_alerts += 1
             return ActionResult(
                 status="success", detail=f"Doctor alerted for patient {patient.bed_id}"
-            ), 0.03
+            ), pre_reward
 
         if action.action_type == ActionType.ESCALATE:
             if (
@@ -533,18 +564,18 @@ class SakhaEnvironment(Environment[SakhaAction, SakhaObservation, SakhaState]):
                 return ActionResult(
                     status="no_effect",
                     detail=f"Escalation workflow incomplete for patient {patient.bed_id}",
-                ), -0.015
+                ), pre_reward
             if patient.incident_escalated:
                 self._episode_metrics.no_effect_actions += 1
                 return ActionResult(
                     status="no_effect", detail=f"Patient {patient.bed_id} already escalated"
-                ), -0.005
+                ), pre_reward
             patient.incident_escalated = True
             patient.last_escalation_step = self._state.step_count
             self._episode_metrics.escalations += 1
             return ActionResult(
                 status="success", detail=f"Escalated patient {patient.bed_id}"
-            ), 0.08
+            ), pre_reward
 
         if action.action_type == ActionType.UPDATE_CHART:
             recent_assessment = (
@@ -560,23 +591,21 @@ class SakhaEnvironment(Environment[SakhaAction, SakhaObservation, SakhaState]):
                 return ActionResult(
                     status="no_effect",
                     detail=f"No recent assessment to document for patient {patient.bed_id}",
-                ), -0.01
+                ), pre_reward
             if patient.active_incident_id >= 0:
                 if not patient.incident_escalated or patient.incident_documented:
                     self._episode_metrics.no_effect_actions += 1
                     return ActionResult(
                         status="no_effect",
                         detail=f"Incident workflow incomplete for patient {patient.bed_id}",
-                    ), -0.01
+                    ), pre_reward
                 patient.incident_documented = True
                 patient.incident_resolved_step = self._state.step_count
                 patient.critical_incidents_resolved += 1
                 self._episode_metrics.critical_incidents_resolved += 1
-                reward = 0.05
                 if self._state.step_count <= patient.incident_deadline_step:
                     patient.critical_incidents_resolved_in_time += 1
                     self._episode_metrics.critical_incidents_resolved_in_time += 1
-                    reward = 0.12
                 patient.active_incident_id = -1
                 patient.incident_onset_step = -1
                 patient.incident_deadline_step = -1
@@ -593,7 +622,6 @@ class SakhaEnvironment(Environment[SakhaAction, SakhaObservation, SakhaState]):
                 and patient.admission_reviewed
                 and not patient.admission_documented
             ):
-                reward = 0.04
                 patient.admission_documented = True
                 patient.admission_review_required = False
                 patient.admissions_completed += 1
@@ -601,14 +629,12 @@ class SakhaEnvironment(Environment[SakhaAction, SakhaObservation, SakhaState]):
                 if self._state.step_count <= patient.admission_due_step:
                     patient.admissions_on_time += 1
                     self._episode_metrics.admissions_on_time += 1
-            else:
-                reward = 0.02
             patient.last_documented_step = self._state.step_count
             patient.documentation_count += 1
             self._episode_metrics.documentations += 1
             return ActionResult(
                 status="success", detail=f"Updated chart for patient {patient.bed_id}"
-            ), reward
+            ), pre_reward
 
         if action.action_type == ActionType.PREPARE_DISCHARGE:
             recently_documented = patient.last_documented_step >= self._state.step_count - 10
@@ -627,23 +653,31 @@ class SakhaEnvironment(Environment[SakhaAction, SakhaObservation, SakhaState]):
                 self._episode_metrics.no_effect_actions += 1
                 return ActionResult(
                     status="no_effect", detail=f"Patient {patient.bed_id} not ready for discharge"
-                ), -0.01
+                ), pre_reward
             patient.discharge_prepared = True
             self._episode_metrics.discharges_prepared += 1
             return ActionResult(
                 status="success", detail=f"Prepared discharge for patient {patient.bed_id}"
-            ), 0.08
+            ), pre_reward
 
         self._episode_metrics.invalid_actions += 1
-        return ActionResult(status="invalid", detail=f"Unknown action {action.action_type}"), -0.02
+        return ActionResult(
+            status="invalid", detail=f"Unknown action {action.action_type}"
+        ), pre_reward
 
     def _apply_deadline_penalties(self, action: SakhaAction) -> float:
-        reward = 0.0
+        penalty = _compute_deadline_penalty(
+            action,
+            self._state.step_count,
+            self._ward.patients,
+            self._last_ward_sweep_step,
+            self._task_config,
+        )
         pending_before_review = any(
             not patient.discharge_prepared for patient in self._ward.patients
         )
         if action.action_type == ActionType.NOOP and self._has_pending_work():
-            reward -= 0.03
+            pass
         for patient in self._ward.patients:
             if patient.discharge_prepared:
                 continue
@@ -652,13 +686,11 @@ class SakhaEnvironment(Environment[SakhaAction, SakhaObservation, SakhaState]):
                     patient.medication_overdue_counted = True
                     patient.overdue_tasks += 1
                     self._episode_metrics.overdue_tasks += 1
-                    reward -= 0.04
             if patient.vitals_due and not patient.vitals_overdue_counted:
                 if self._state.step_count > patient.vitals_due_by_step + VITALS_GRACE_STEPS:
                     patient.vitals_overdue_counted = True
                     patient.overdue_tasks += 1
                     self._episode_metrics.overdue_tasks += 1
-                    reward -= 0.05
             if patient.active_incident_id >= 0 and not patient.incident_overdue_counted:
                 if self._state.step_count > patient.incident_deadline_step:
                     patient.incident_overdue_counted = True
@@ -666,16 +698,14 @@ class SakhaEnvironment(Environment[SakhaAction, SakhaObservation, SakhaState]):
                     patient.overdue_tasks += 1
                     self._episode_metrics.critical_incidents_missed += 1
                     self._episode_metrics.overdue_tasks += 1
-                    reward -= 0.12
             if patient.admission_review_required and not patient.admission_overdue_counted:
                 if self._state.step_count > patient.admission_due_step:
                     patient.admission_overdue_counted = True
                     patient.overdue_tasks += 1
                     self._episode_metrics.overdue_tasks += 1
-                    reward -= 0.05
         if not pending_before_review:
-            return reward
-        return reward
+            return penalty
+        return penalty
 
     def _build_pending_tasks(self, patients: list[PatientState]) -> list[PendingTask]:
         tasks: list[PendingTask] = []

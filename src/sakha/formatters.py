@@ -1,5 +1,6 @@
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
+from pathlib import Path
 
 
 class StatusIcons:
@@ -276,6 +277,3 @@ def get_formatter(name: str = "compact", output_file: str | None = None) -> Form
     if output_file and name == "json":
         return formatter_cls(output_file)
     return formatter_cls()
-
-
-from pathlib import Path
