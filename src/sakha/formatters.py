@@ -4,8 +4,8 @@ from pathlib import Path
 
 
 class StatusIcons:
-    OK = "✓"
-    FAIL = "✗"
+    OK = "[OK]"
+    FAIL = "[FAIL]"
     SKIP = "!"
 
     @staticmethod
@@ -28,8 +28,8 @@ class StatusIcons:
 
 
 class StatusLabels:
-    DONE = "✓"
-    INCOMPLETE = "✗"
+    DONE = "[OK]"
+    INCOMPLETE = "[FAIL]"
 
 
 class ScoreBar:
@@ -145,7 +145,7 @@ class CompactFormatter(Formatter):
         print(" FULL RESULTS")
         print("=" * 40)
         for r in results:
-            done_icon = "✓" if r.done else "✗"
+            done_icon = "[OK]" if r.done else "[FAIL]"
             incidents = (
                 f" | {r.critical_incidents_missed} missed" if r.critical_incidents_missed else ""
             )

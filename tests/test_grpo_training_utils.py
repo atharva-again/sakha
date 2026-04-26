@@ -1,10 +1,12 @@
 from sakha.grpo_training import (
+    build_grpo_prompt,
     build_state_aligned_examples,
     choose_queue_head_action,
     parse_action_response_with_status,
     reconstruct_env_state,
     score_completion_action,
 )
+from sakha.env import SakhaEnvironment
 from sakha.models import ActionType
 
 
@@ -97,6 +99,106 @@ def test_parser_ignores_distractor_calls_inside_thinking_with_no_answer():
     response = "<think>look at step(0) and patient(2) carefully</think>"
     _, parsed_ok = parse_action_response_with_status(response)
     assert parsed_ok is False
+
+
+def test_parser_accepts_multi_arg_call_taking_first_int():
+    """The model frequently copies the prompt's pending_tasks display
+    format (``check_vitals(11) p=50 due=0``) into the answer slot, but
+    occasionally mashes the metadata into the parens as
+    ``check_vitals(11, p=50, due=0)``. That is recoverable: the action
+    name and patient_id are unambiguous; only the trailing metadata is
+    junk. Treat it as a successful parse on the first integer."""
+    cases = {
+        "check_vitals(11, p=50, due=0)": (ActionType.CHECK_VITALS, 11),
+        "check_vitals(18, 7)": (ActionType.CHECK_VITALS, 18),
+        "administer_medicine(3, ceftriaxone)": (ActionType.ADMINISTER_MEDICINE, 3),
+    }
+    for response, (expected_type, expected_id) in cases.items():
+        action, parsed_ok = parse_action_response_with_status(response)
+        assert parsed_ok, response
+        assert action.action_type == expected_type, response
+        assert action.patient_id == expected_id, response
+
+
+def test_prompt_no_arg_actions_render_without_patient_id():
+    """A pending ``medication_round`` task may carry a head patient_id for
+    bookkeeping, but the system prompt advertises ``medication_round()`` as
+    no-arg. Rendering ``medication_round(15)`` in pending_tasks teaches the
+    model a contradictory signature."""
+    env = SakhaEnvironment(task="hard")
+    obs = env.reset(seed=42)
+    messages = build_grpo_prompt(obs, task="hard", episode_id=0)
+    user_content = messages[1]["content"]
+    for verb in ("medication_round", "ward_sweep", "noop"):
+        # Either the verb doesn't appear in pending tasks at all (fine) or
+        # it appears with empty parens. Never with an integer arg.
+        for line in user_content.splitlines():
+            if line.startswith(f"- {verb}("):
+                assert line.startswith(f"- {verb}() "), line
+
+
+def test_score_returns_zero_on_done_replay():
+    """If replay reaches a terminal state the model is being asked to act
+    on a state with no correct answer. That should be a neutral signal,
+    not a parse-failure penalty that corrupts the gradient."""
+    env = SakhaEnvironment(task="easy")
+    obs = env.reset(seed=42)
+    replay_actions = []
+    while not obs.done:
+        action = choose_queue_head_action(obs)
+        replay_actions.append(
+            {
+                "action_type": action.action_type.value,
+                "patient_id": action.patient_id,
+                "medicine_id": action.medicine_id,
+                "reason_code": action.reason_code,
+            }
+        )
+        obs = env.step(action)
+        if len(replay_actions) > 200:
+            break
+
+    import json
+
+    reward = score_completion_action(
+        "noop()",
+        task="easy",
+        seed=42,
+        replay_actions_json=json.dumps(replay_actions),
+    )
+    assert reward == 0.0
+
+
+def test_score_clips_extreme_env_rewards():
+    """A single incident-resolution event scaled x10 can exceed +/-5.0,
+    which dominates GRPO advantage estimation with small group sizes.
+    The scorer must clip so that no single event drowns the rest of the
+    group."""
+    examples = build_state_aligned_examples(
+        task="easy", episodes=1, seed=42, max_steps=96, state_steps=(0,)
+    )
+    reward = score_completion_action(
+        "noop()",
+        task="easy",
+        seed=examples["seed"][0],
+        replay_actions_json=examples["replay_actions_json"][0],
+    )
+    assert -2.0 <= reward <= 2.0
+
+
+def test_state_aligned_examples_drops_steps_past_max():
+    """``state_steps`` includes values up to 88 but eval may run
+    ``max_steps=48``. Naive ``min(s, max_steps - 1)`` clamps everything
+    >= 48 to 47, piling training mass on a state the model will never see.
+    The bounded version filters them out instead."""
+    examples = build_state_aligned_examples(
+        task="easy",
+        episodes=14,
+        seed=42,
+        max_steps=48,
+        state_steps=(0, 4, 8, 12, 16, 24, 32, 40, 48, 56, 64, 72, 80, 88),
+    )
+    assert all(t < 48 for t in examples["target_step"])
 
 
 def test_state_aligned_example_reconstructs_prompt_step():

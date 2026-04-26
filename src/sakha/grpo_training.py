@@ -35,8 +35,13 @@ _THINK_CLOSE = "</think>"
 
 # `name(args?)` where args may be a bare integer, a keyword form
 # (`patient_id=3`, `id=3`, `pid=3`, ...), or empty for no-arg actions.
+# Trailing junk before `)` (`(11, p=50, due=0)`, `(11, 7)`) is tolerated
+# because the model frequently copies the prompt's `pending_tasks` display
+# format into its answer; we take the *first* integer as the patient_id and
+# silently drop the rest. Action-name validation against ACTION_NAME_MAP
+# below still gates this from accepting arbitrary names.
 _ACTION_RE = re.compile(
-    r"\b([a-z_]+)\s*\(\s*(?:[a-z_][a-z_0-9]*\s*=\s*)?(\d+)?\s*\)",
+    r"\b([a-z_]+)\s*\(\s*(?:[a-z_][a-z_0-9]*\s*=\s*)?(\d+)?[^)]*\)",
 )
 
 
@@ -158,16 +163,31 @@ DEFAULT_REPLAY_POLICIES: tuple[str, ...] = (
 )
 
 
+_NO_ARG_ACTIONS: frozenset[ActionType] = frozenset(
+    {ActionType.MEDICATION_ROUND, ActionType.WARD_SWEEP, ActionType.NOOP}
+)
+
+
+def _render_pending_task(task_obj: Any) -> str:
+    """Render a pending task using the same arity as the system prompt.
+
+    The model copies this format into its answer (e.g. ``check_vitals(11)``).
+    If we render a no-arg action with a patient_id (``medication_round(15)``)
+    we teach the model a signature that contradicts the system prompt, which
+    is exactly what produced ``check_vitals(11, p=50, due=0)``-style outputs
+    in earlier runs.
+    """
+    name = task_obj.required_action.value
+    if task_obj.required_action in _NO_ARG_ACTIONS or task_obj.patient_id is None:
+        arg = ""
+    else:
+        arg = str(task_obj.patient_id)
+    return f"- {name}({arg}) p={task_obj.priority} due={task_obj.due_step}"
+
+
 def build_grpo_prompt(obs: SakhaObservation, *, task: str, episode_id: int) -> list[dict[str, str]]:
     pending = obs.ward_state.pending_tasks[:5] if obs.ward_state.pending_tasks else []
-    tasks_str = "\n".join(
-        (
-            f"- {task_obj.required_action.value}"
-            f"({task_obj.patient_id if task_obj.patient_id is not None else ''})"
-            f" p={task_obj.priority} due={task_obj.due_step}"
-        )
-        for task_obj in pending
-    ) or "- No pending tasks"
+    tasks_str = "\n".join(_render_pending_task(t) for t in pending) or "- No pending tasks"
 
     active_incidents = [
         patient
@@ -242,9 +262,15 @@ def build_state_aligned_examples(
         "replay_actions_json": [],
     }
 
+    # Drop any state_step beyond what eval will actually visit. Otherwise
+    # ``min(s, max_steps - 1)`` clamps several values to the same terminal
+    # step and silently piles training mass onto a state the model will
+    # never see at evaluation time.
+    state_steps_bounded = tuple(s for s in state_steps if s < max_steps) or (0,)
+
     for example_id in range(episodes):
         episode_seed = seed + example_id
-        target_step = min(state_steps[example_id % len(state_steps)], max(0, max_steps - 1))
+        target_step = state_steps_bounded[example_id % len(state_steps_bounded)]
         policy_name = replay_policies[example_id % len(replay_policies)]
         policy = _replay_policy(policy_name)
         rng = random.Random(episode_seed * 1009 + example_id)
@@ -286,14 +312,29 @@ def score_completion_action(
     task: str,
     seed: int,
     replay_actions_json: str,
-    parse_failure_reward: float = -0.2,
+    parse_failure_reward: float = -1.0,
     env_reward_scale: float = 10.0,
+    env_reward_clip: float = 2.0,
     format_bonus: float = 0.0,
 ) -> float:
     """Score a single GRPO completion by stepping the env from the prompt state.
 
-    No format bonus is applied by default: a parseable action that the env
-    rejects (or no-effect noop) should not look better than a strong action.
+    Reward shape choices:
+
+    * ``parse_failure_reward = -1.0`` — must be more painful than any
+      legitimate-but-suboptimal action so GRPO can't reward the model for
+      ambiguous output. The previous -0.2 was cheaper than most env-side
+      missteps and let the model coast on parens-shaped junk.
+    * ``env_reward_clip = +/-2.0`` — incident-resolution events produce env
+      rewards in the +0.3-0.5 range; x10 scaling pushes them past +5, which
+      with ``num_generations=4`` makes a single lucky completion dominate
+      every other completion in the group's advantage. Clipping bounds
+      single-event variance without erasing the signal.
+    * ``obs.done`` after replay returns ``0.0`` (neutral skip), not a parse
+      failure. The model is being asked to act on a terminal state — there
+      is no correct answer to learn from.
+    * No format bonus by default: a parseable action that the env rejects
+      should not look better than a strong action.
     """
     action, parsed_ok = parse_action_response_with_status(completion)
     if not parsed_ok:
@@ -304,9 +345,11 @@ def score_completion_action(
             task=task, seed=seed, replay_actions_json=replay_actions_json
         )
         if obs.done:
-            return parse_failure_reward
+            return 0.0
         scored_obs = env.step(action)
     except Exception:
         return parse_failure_reward
 
-    return float((scored_obs.reward or 0.0) * env_reward_scale + format_bonus)
+    raw = (scored_obs.reward or 0.0) * env_reward_scale
+    clipped = max(-env_reward_clip, min(env_reward_clip, raw))
+    return float(clipped + format_bonus)
