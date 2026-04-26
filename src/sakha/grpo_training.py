@@ -143,12 +143,12 @@ def build_grpo_prompt(obs: SakhaObservation, *, task: str, episode_id: int) -> l
         if patient.vitals_due and not patient.discharge_prepared
     ]
 
-    # /no_think disables Qwen3's <think> reasoning blocks. We want this in BOTH
-    # training and eval so the model's policy is "emit one action immediately"
-    # in both regimes — no train/eval drift, ~5-8x faster eval, and Qwen3-0.6B's
-    # CoT doesn't help on this kind of pattern-match task anyway.
+    # Note: Qwen3-0.6B reliably emits the `action_name(id)` format only when
+    # its thinking pass is allowed to set it up. Disabling thinking on this size
+    # of model produces natural-language slop without parens → 90%+ parse
+    # failures. Keep thinking on; we instead control cost via max_new_tokens.
     system_msg = (
-        "/no_think You are a hospital ward assistant. Return exactly one action call.\n"
+        "You are a hospital ward assistant. Return exactly one action call.\n"
         "Actions: review_patient(id), check_vitals(id), administer_medicine(id), "
         "alert_doctor(id), escalate(id), update_chart(id), prepare_discharge(id), "
         "medication_round(), ward_sweep(), noop()."
