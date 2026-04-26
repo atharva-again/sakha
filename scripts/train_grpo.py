@@ -48,7 +48,7 @@ LOAD_IN_4BIT = True                  # 4-bit quantization (critical for T4)
 # GRPO specific
 NUM_GENERATIONS = 4                  # Responses per prompt
 LEARNING_RATE = 1e-5                 # Learning rate
-MAX_COMPLETION_LENGTH = 512          # Max tokens per completion
+MAX_COMPLETION_LENGTH = 64           # Max tokens per completion (action call is ~5 tokens with /no_think)
 MAX_SEQ_LENGTH = 2048                # Prompt + completion context for vLLM/Unsloth
 
 # Checkpoint directory.
@@ -223,14 +223,26 @@ def run_llm_eval_batched(task, model, tokenizer, seeds, max_steps):
 
         # Build prompts using the SAME builder as training so the model sees the
         # exact distribution it was optimized on.
+        # Qwen3 ships with thinking mode ON by default — that bloats every
+        # response with <think>...</think> tokens before the answer and turns a
+        # 5-token action call into 100+ tokens. We never want that for eval.
         prompt_texts = []
         for i in active_indices:
             messages = build_grpo_prompt(
                 observations[i], task=task, episode_id=seeds[i]
             )
-            prompt_text = tokenizer.apply_chat_template(
-                messages, tokenize=False, add_generation_prompt=True
-            )
+            try:
+                prompt_text = tokenizer.apply_chat_template(
+                    messages,
+                    tokenize=False,
+                    add_generation_prompt=True,
+                    enable_thinking=False,
+                )
+            except TypeError:
+                # Older tokenizers / non-Qwen3 templates don't accept the kwarg.
+                prompt_text = tokenizer.apply_chat_template(
+                    messages, tokenize=False, add_generation_prompt=True
+                )
             prompt_texts.append(prompt_text)
 
         # Batch tokenize with left-padding
@@ -238,10 +250,12 @@ def run_llm_eval_batched(task, model, tokenizer, seeds, max_steps):
             prompt_texts, return_tensors="pt", padding=True
         ).to(device)
 
-        # Single batched generation call
+        # 32 is plenty for "review_patient(99)" + EOS. Was 64 before, but with
+        # thinking disabled we cap aggressively because each extra token costs
+        # one full forward pass over the active batch.
         with torch.no_grad():
             outputs = model.generate(
-                **inputs, max_new_tokens=64, do_sample=False,
+                **inputs, max_new_tokens=32, do_sample=False,
                 pad_token_id=tokenizer.pad_token_id,
             )
 
