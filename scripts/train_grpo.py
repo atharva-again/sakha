@@ -37,7 +37,7 @@ from sakha.graders import score_easy_task, score_medium_task, score_hard_task
 # Training configuration
 MODEL = "Qwen/Qwen3-0.6B"          # Model to train (0.6B fits on T4)
 TASK = "hard"                      # Task difficulty: easy | medium | hard
-EPISODES = 200                       # Number of training episodes
+EPISODES = 200                       # Training examples (seed × state × policy). 200 ≈ 50 optimizer steps.
 MAX_STEPS = 96                       # Max steps per episode (96 = full 8hr shift)
 SEED = 42                            # Random seed for reproducibility
 
@@ -51,9 +51,23 @@ LEARNING_RATE = 1e-5                 # Learning rate
 MAX_COMPLETION_LENGTH = 512          # Max tokens per completion
 MAX_SEQ_LENGTH = 2048                # Prompt + completion context for vLLM/Unsloth
 
-# Checkpoint directory
-CHECKPOINT_DIR = Path("./grpo_output")
+# Checkpoint directory.
+# Set SAKHA_OUTPUT_DIR (e.g. "/content/drive/MyDrive/sakha_grpo" in Colab once you've
+# mounted Drive) so checkpoints and eval caches survive a session restart. If unset,
+# we auto-detect a mounted Drive folder; otherwise we fall back to ./grpo_output.
+def _default_output_dir() -> Path:
+    env_dir = os.environ.get("SAKHA_OUTPUT_DIR")
+    if env_dir:
+        return Path(env_dir).expanduser()
+    drive_root = Path("/content/drive/MyDrive")
+    if drive_root.exists():
+        return drive_root / "sakha_grpo"
+    return Path("./grpo_output")
+
+
+CHECKPOINT_DIR = _default_output_dir()
 CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
+print(f"  Checkpoint dir: {CHECKPOINT_DIR}")
 
 print(f"Training config:")
 print(f"  Model: {MODEL}")
@@ -207,13 +221,13 @@ def run_llm_eval_batched(task, model, tokenizer, seeds, max_steps):
             pbar.update(max_steps - step)
             break
 
-        # Build prompts for all active environments
+        # Build prompts using the SAME builder as training so the model sees the
+        # exact distribution it was optimized on.
         prompt_texts = []
         for i in active_indices:
-            messages = [
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": build_eval_prompt(observations[i])},
-            ]
+            messages = build_grpo_prompt(
+                observations[i], task=task, episode_id=seeds[i]
+            )
             prompt_text = tokenizer.apply_chat_template(
                 messages, tokenize=False, add_generation_prompt=True
             )
@@ -335,7 +349,15 @@ print(f"Base LLM mean grader score: {base_results['summary']['mean_grader_score'
 # Notebook Cell: 7. Load Model with Unsloth (Optional)
 # ============================================================
 
-if USE_UNSLOTH:
+# Decide up front whether we'll need to actually train. If a usable checkpoint
+# already exists we skip the (expensive) Unsloth/vLLM load too, which keeps
+# session-restart re-runs fast and frees VRAM for the trained-eval step.
+_pretraining_ckpts = sorted(CHECKPOINT_DIR.glob("checkpoint-*"))
+_force_retrain = os.environ.get("SAKHA_FORCE_RETRAIN") == "1"
+_resume_training = os.environ.get("SAKHA_RESUME_TRAINING") == "1"
+_will_train = (not _pretraining_ckpts) or _force_retrain or _resume_training
+
+if _will_train and USE_UNSLOTH:
     from unsloth import FastLanguageModel, PatchFastRL
     PatchFastRL("GRPO", FastLanguageModel)
 
@@ -356,8 +378,12 @@ if USE_UNSLOTH:
         random_state=SEED,
     )
     print(f"Unsloth model loaded for training: {MODEL}")
-else:
+elif _will_train:
     model = MODEL
+    tokenizer = None
+else:
+    print("Existing checkpoints found, skipping model load until trained-eval step.")
+    model = None
     tokenizer = None
 
 # ============================================================
@@ -378,7 +404,8 @@ grpo_config = GRPOConfig(
     save_steps=50,
     save_total_limit=3,
     report_to=[],
-    output_dir="./grpo_output",
+    output_dir=str(CHECKPOINT_DIR),
+    overwrite_output_dir=False,
     seed=SEED,
     remove_unused_columns=False,
     use_vllm=USE_UNSLOTH,
@@ -401,9 +428,28 @@ if USE_UNSLOTH:
 else:
     trainer_kwargs["model"] = MODEL
 
-trainer = GRPOTrainer(**trainer_kwargs)
-print(f"Starting training: {EPISODES} episodes, task={TASK}")
-trainer.train()
+# --- Training control flow ---
+# Default behavior: if checkpoints already exist in CHECKPOINT_DIR, skip training and
+# jump straight to trained-eval (so a session restart doesn't redo expensive RL steps).
+#   SAKHA_FORCE_RETRAIN=1   -> train fresh (resumes from latest if present)
+#   SAKHA_RESUME_TRAINING=1 -> continue training from the latest checkpoint
+if not _will_train:
+    print(
+        f"Found {len(_pretraining_ckpts)} existing checkpoint(s) in {CHECKPOINT_DIR}. "
+        "Skipping training (set SAKHA_FORCE_RETRAIN=1 or SAKHA_RESUME_TRAINING=1 to override)."
+    )
+else:
+    trainer = GRPOTrainer(**trainer_kwargs)
+    resume_path = (
+        str(_pretraining_ckpts[-1])
+        if (_pretraining_ckpts and _resume_training)
+        else None
+    )
+    if resume_path:
+        print(f"Resuming training from {resume_path}")
+    else:
+        print(f"Starting training: {EPISODES} episodes, task={TASK}")
+    trainer.train(resume_from_checkpoint=resume_path)
 
 # ============================================================
 # Notebook Cell: 10. Post-Training Evaluation — Trained LLM
@@ -413,8 +459,7 @@ TRAINED_CACHE = CHECKPOINT_DIR / "trained_eval_cache.json"
 trained_results = load_eval_cache(TRAINED_CACHE)
 
 if trained_results is None:
-    from peft import PeftModel
-    ckpts = sorted(Path("./grpo_output").glob("checkpoint-*"))
+    ckpts = sorted(CHECKPOINT_DIR.glob("checkpoint-*"))
     if not ckpts:
         print("No checkpoints found. Skipping trained eval.")
         trained_results = None
@@ -422,26 +467,35 @@ if trained_results is None:
         CHECKPOINT_PATH = str(ckpts[-1])
         print(f"Loading trained checkpoint: {CHECKPOINT_PATH}")
 
-        if USE_UNSLOTH:
-            from unsloth import FastLanguageModel
-            trained_model, trained_tokenizer = FastLanguageModel.from_pretrained(
-                model_name=CHECKPOINT_PATH,
-                max_seq_length=MAX_SEQ_LENGTH,
-                load_in_4bit=LOAD_IN_4BIT,
-                fast_inference=True,
-                gpu_memory_utilization=0.6,
-            )
-            FastLanguageModel.for_inference(trained_model)
-        else:
-            from transformers import AutoModelForCausalLM, AutoTokenizer
-            from peft import PeftModel
-            trained_tokenizer = AutoTokenizer.from_pretrained(MODEL, trust_remote_code=True, padding_side="left")
-            base_for_trained = AutoModelForCausalLM.from_pretrained(
-                MODEL, torch_dtype=torch.float16, device_map="auto", trust_remote_code=True
-            )
-            trained_model = PeftModel.from_pretrained(base_for_trained, CHECKPOINT_PATH)
-            trained_model = trained_model.merge_and_unload()
-            trained_model.eval()
+        # Free training-time resources before loading the eval model.
+        try:
+            del trainer
+        except NameError:
+            pass
+        try:
+            del model
+        except NameError:
+            pass
+        gc.collect()
+        torch.cuda.empty_cache()
+
+        # Always evaluate via plain transformers + PEFT. This matches the base-eval
+        # code path exactly (so the comparison is apples-to-apples) and avoids the
+        # "lm_head.weight ... newly initialized" warning that the Unsloth/vLLM path
+        # surfaces for tied-embedding models like Qwen3.
+        from peft import PeftModel
+        trained_tokenizer = AutoTokenizer.from_pretrained(
+            MODEL, trust_remote_code=True, padding_side="left"
+        )
+        base_for_trained = AutoModelForCausalLM.from_pretrained(
+            MODEL,
+            torch_dtype=torch.float16,
+            device_map="auto",
+            trust_remote_code=True,
+        )
+        trained_model = PeftModel.from_pretrained(base_for_trained, CHECKPOINT_PATH)
+        trained_model = trained_model.merge_and_unload()
+        trained_model.eval()
 
         if trained_tokenizer.pad_token is None:
             trained_tokenizer.pad_token = trained_tokenizer.eos_token
@@ -451,6 +505,12 @@ if trained_results is None:
         trained_results["policy"] = "trained_llm"
         save_eval_cache(trained_results, TRAINED_CACHE)
         print(f"Trained mean grader score: {trained_results['summary']['mean_grader_score']:.4f}")
+
+        del trained_model
+        del base_for_trained
+        del trained_tokenizer
+        gc.collect()
+        torch.cuda.empty_cache()
 
 # ============================================================
 # Notebook Cell: 11. Base vs Trained Comparison
@@ -485,7 +545,8 @@ if trained_results is not None:
     ax.legend()
     ax.grid(True, alpha=0.3)
     plt.tight_layout()
-    plt.savefig("./grpo_output/base_vs_trained.png", dpi=150)
-    print("Plot saved to ./grpo_output/base_vs_trained.png")
+    plot_path = CHECKPOINT_DIR / "base_vs_trained.png"
+    plt.savefig(plot_path, dpi=150)
+    print(f"Plot saved to {plot_path}")
 else:
     print("Skipping comparison — no trained eval results available.")

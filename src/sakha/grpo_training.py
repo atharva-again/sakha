@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import json
+import random
 import re
+from collections.abc import Callable
 from typing import Any
 
 from sakha.env import SakhaEnvironment
@@ -22,7 +24,7 @@ ACTION_NAME_MAP = {
     "noop": ActionType.NOOP,
 }
 
-DEFAULT_STATE_STEPS = (0, 4, 8, 16, 32, 48, 64, 80)
+DEFAULT_STATE_STEPS = (0, 4, 8, 12, 16, 24, 32, 40, 48, 56, 64, 72, 80, 88)
 ACTION_RE = re.compile(r"([a-zA-Z_]+)\s*\(\s*(\d+)?\s*\)")
 
 
@@ -68,6 +70,41 @@ def choose_queue_head_action(obs: SakhaObservation) -> SakhaAction:
         return SakhaAction(action_type=ActionType.NOOP, patient_id=None)
     task = obs.ward_state.pending_tasks[0]
     return SakhaAction(action_type=task.required_action, patient_id=task.patient_id)
+
+
+def choose_random_pending_action(obs: SakhaObservation, rng: random.Random) -> SakhaAction:
+    """Pick a random pending task to reach a different (and noisier) trajectory state."""
+    if not obs.ward_state.pending_tasks:
+        return SakhaAction(action_type=ActionType.NOOP, patient_id=None)
+    task = rng.choice(obs.ward_state.pending_tasks)
+    return SakhaAction(action_type=task.required_action, patient_id=task.patient_id)
+
+
+def choose_noisy_queue_head_action(obs: SakhaObservation, rng: random.Random) -> SakhaAction:
+    """Mostly queue head, occasionally NOOP, to expose the model to backlog states."""
+    if rng.random() < 0.15:
+        return SakhaAction(action_type=ActionType.NOOP, patient_id=None)
+    return choose_queue_head_action(obs)
+
+
+ReplayPolicy = Callable[[SakhaObservation, random.Random], SakhaAction]
+
+
+def _replay_policy(name: str) -> ReplayPolicy:
+    if name == "queue_head":
+        return lambda obs, _rng: choose_queue_head_action(obs)
+    if name == "random_pending":
+        return choose_random_pending_action
+    if name == "noisy_queue_head":
+        return choose_noisy_queue_head_action
+    raise ValueError(f"Unknown replay policy: {name}")
+
+
+DEFAULT_REPLAY_POLICIES: tuple[str, ...] = (
+    "queue_head",
+    "noisy_queue_head",
+    "random_pending",
+)
 
 
 def build_grpo_prompt(obs: SakhaObservation, *, task: str, episode_id: int) -> list[dict[str, str]]:
@@ -135,7 +172,14 @@ def build_state_aligned_examples(
     seed: int,
     max_steps: int,
     state_steps: tuple[int, ...] = DEFAULT_STATE_STEPS,
+    replay_policies: tuple[str, ...] = DEFAULT_REPLAY_POLICIES,
 ) -> dict[str, list[Any]]:
+    """Generate (prompt, seed, target_step, replay_actions) tuples for GRPO training.
+
+    Each "episode" here is one training example: a different (seed, target_step,
+    replay_policy) combination so the dataset covers many states the model will
+    actually see at evaluation time, not just the same 8 snapshots.
+    """
     examples: dict[str, list[Any]] = {
         "prompt": [],
         "seed": [],
@@ -143,9 +187,13 @@ def build_state_aligned_examples(
         "replay_actions_json": [],
     }
 
-    for episode_id in range(episodes):
-        episode_seed = seed + episode_id
-        target_step = min(state_steps[episode_id % len(state_steps)], max(0, max_steps - 1))
+    for example_id in range(episodes):
+        episode_seed = seed + example_id
+        target_step = min(state_steps[example_id % len(state_steps)], max(0, max_steps - 1))
+        policy_name = replay_policies[example_id % len(replay_policies)]
+        policy = _replay_policy(policy_name)
+        rng = random.Random(episode_seed * 1009 + example_id)
+
         env = SakhaEnvironment(task=task)
         obs = env.reset(seed=episode_seed)
         replay_actions: list[dict[str, Any]] = []
@@ -153,11 +201,11 @@ def build_state_aligned_examples(
         for _ in range(target_step):
             if obs.done:
                 break
-            action = choose_queue_head_action(obs)
+            action = policy(obs, rng)
             replay_actions.append(action_to_replay_dict(action))
             obs = env.step(action)
 
-        examples["prompt"].append(build_grpo_prompt(obs, task=task, episode_id=episode_id))
+        examples["prompt"].append(build_grpo_prompt(obs, task=task, episode_id=example_id))
         examples["seed"].append(episode_seed)
         examples["target_step"].append(obs.ward_state.current_step)
         examples["replay_actions_json"].append(json.dumps(replay_actions))
@@ -185,8 +233,13 @@ def score_completion_action(
     replay_actions_json: str,
     parse_failure_reward: float = -0.2,
     env_reward_scale: float = 10.0,
-    format_bonus: float = 0.02,
+    format_bonus: float = 0.0,
 ) -> float:
+    """Score a single GRPO completion by stepping the env from the prompt state.
+
+    No format bonus is applied by default: a parseable action that the env
+    rejects (or no-effect noop) should not look better than a strong action.
+    """
     action, parsed_ok = parse_action_response_with_status(completion)
     if not parsed_ok:
         return parse_failure_reward
