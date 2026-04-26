@@ -2,15 +2,17 @@
 
 ## Introduction
 
-Imagine someone close to you is lying in a hospital ward. It could be an ICU or a general ward, but the situation is almost always the same. There are around 17 to 18 patients in a single ward, and only one or two attendants managing all of them. They are responsible for everything — giving medicines on time, checking BP, temperature, oxygen levels, managing routines, and responding when doctors call. Every patient needs attention, every task has a time
-Now think about this — your family member is just one of those 18 patients. The attendant responsible is constantly moving from bed to bed, patient to patient. At the same time, family members are calling them from different directions, asking for help. This continues for hours, through an entire 8-hour shift, and slowly it becomes overwhelming. Not because they don’t care, but because one person simply cannot manage 18 lives perfectly at the same time.
-And that’s when things start to break.  small mistakes that can lead to serious consequences.
+Imagine someone close to you is in a hospital ward. It could be an ICU or a general ward, but the situation is almost always the same. There are around 17 to 18 patients in a single ward, and only one or two attendants managing all of them. They are responsible for everything — giving medicines on time, checking BP, temperature, oxygen levels, managing routines, and responding when doctors call. Every patient needs attention, every task has a deadline.
+
+Now think about this: your family member is just one of those 18 patients. The attendant responsible is constantly moving from bed to bed, patient to patient. At the same time, family members are calling them from different directions, asking for help. This continues for hours, through an entire 8-hour shift, and slowly it becomes overwhelming. Not because they don’t care, but because one person simply cannot manage 18 lives perfectly at the same time.
+
 On top of this, there is another major problem — the shift change. In the morning, one attendant handles the ward, and in the evening, a new one takes over. The handover is often incomplete or rushed, and the new attendant ends up managing the same 18 patients with only partial information.
+
 This is the reality in many hospitals today, and this is the problem we are solving.
 
 We are building **Sakha**
 
-> *Sakha means a friend. The kind of friend who stays with you in your toughest time and quietly tells you what matters most*
+> *Sakha is an AI agent that can manage wards. It has the ability to take the whole state parameters of the ward at any time and provide the most optimal action to take.*
 
 ---
 
@@ -50,7 +52,7 @@ Time keeps moving, and Sakha keeps checking:
 
 It then **reorders priorities dynamically**.
 
-If something critical happens—like abnormal vitals—it immediately jumps to the top.
+If something critical happens, like abnormal vitals, it immediately jumps to the top.
 
 And every time an action is completed (or missed), Sakha updates its understanding of the situation.
 
@@ -86,29 +88,6 @@ The reward system also considers:
 - Consistency over time  
 
 Instead of training one big complex model, this reward mechanism acts like a **guiding signal**, helping Sakha behave more intelligently and reliably.
-
----
-
-## Approach and Training
-
-Sakha is built using a mix of simple and smart ideas.
-
-Some things are handled using clear rules:
-
-- Medicines at fixed intervals  
-- Scheduled vitals checks  
-
-But when things get messy—like too many tasks at once—Sakha uses AI to:
-
-- Decide what to focus on first  
-- Spot unusual patterns in vitals  
-- Avoid unnecessary alerts  
-
-This balance keeps the system:
-
-- Lightweight  
-- Easy to understand  
-- Practical to use in real environments  
 
 ---
 
@@ -158,13 +137,7 @@ Sakha helps in very practical ways:
 
 ## Future Scope
 
-Right now, Sakha works as a single intelligent assistant helping manage multiple patients. But real hospital scenarios can get even more complex.
-
-Imagine a situation where **multiple patients deteriorate at the same time**.
-
-Today, experienced human caregivers often handle this better because they can split attention, make fast judgments, and coordinate actions instinctively.
-
-But this is where Sakha can evolve.
+Right now, Sakha works as a single intelligent assistant helping manage multiple patients. But real hospital scenarios can get even more complex (multiple wards, different esclation, ICUs, OTs).
 
 The next step is a **multi-agent system**, where:
 
@@ -202,4 +175,4 @@ A real friend when things get difficult.
 
 And that’s the goal:
 
-> **To make sure that even in the busiest, most stressful environments—care never breaks down.**
+> **To make sure that even in the busiest, most stressful environments, care never breaks down.**
