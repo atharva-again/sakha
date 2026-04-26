@@ -25,18 +25,69 @@ ACTION_NAME_MAP = {
 }
 
 DEFAULT_STATE_STEPS = (0, 4, 8, 12, 16, 24, 32, 40, 48, 56, 64, 72, 80, 88)
-ACTION_RE = re.compile(r"([a-zA-Z_]+)\s*\(\s*(\d+)?\s*\)")
+
+# Qwen3-style chain-of-thought block. Reasoning text routinely contains
+# tokens that look like action calls (e.g. "patient(3)", "step(5)") which
+# would otherwise shadow the real answer.
+_THINK_BLOCK_RE = re.compile(r"<think\b[^>]*>.*?</think>", re.DOTALL | re.IGNORECASE)
+_THINK_OPEN = "<think>"
+_THINK_CLOSE = "</think>"
+
+# `name(args?)` where args may be a bare integer, a keyword form
+# (`patient_id=3`, `id=3`, `pid=3`, ...), or empty for no-arg actions.
+_ACTION_RE = re.compile(
+    r"\b([a-z_]+)\s*\(\s*(?:[a-z_][a-z_0-9]*\s*=\s*)?(\d+)?\s*\)",
+)
+
+
+def _strip_thinking(response: str) -> str:
+    """Remove Qwen3 <think>...</think> blocks, including a truncated trailing one.
+
+    A model whose budget is consumed mid-thought emits an unclosed `<think>`
+    block. We drop everything from that opener onward — there is no answer
+    yet, and any `name(args)` patterns inside thinking are reasoning, not
+    output.
+    """
+    cleaned = _THINK_BLOCK_RE.sub("", response)
+    lower = cleaned.lower()
+    open_idx = lower.rfind(_THINK_OPEN)
+    close_idx = lower.rfind(_THINK_CLOSE)
+    if open_idx != -1 and close_idx <= open_idx:
+        cleaned = cleaned[:open_idx]
+    return cleaned
 
 
 def parse_action_response_with_status(response: str) -> tuple[SakhaAction, bool]:
-    """Parse the first valid Sakha action call and report whether parsing succeeded."""
-    response = response.strip().lower()
-    match = ACTION_RE.search(response)
-    if match:
+    """Parse the final Sakha action call from a model completion.
+
+    Strategy (kept deliberately strict on the documented protocol):
+
+    1. Remove ``<think>...</think>`` reasoning blocks so reasoning text like
+       ``"check patient(3) first"`` cannot be mistaken for the answer.
+    2. Iterate over every ``name(args?)`` candidate and keep the *last* one
+       whose name is in :data:`ACTION_NAME_MAP`. Model completions often
+       restate options in prose (``"X first, then Y"``, ``"final answer:
+       Z"``); the committed action is the trailing one.
+    3. Accept either the bare-integer form (``administer_medicine(3)``) or
+       the keyword form (``administer_medicine(patient_id=3)``). Empty
+       parens remain valid for no-arg actions like ``noop()`` and
+       ``medication_round()``.
+
+    Parens are still required: that is the documented system-prompt
+    contract, and loosening it would hide a real format-compliance failure.
+    """
+    cleaned = _strip_thinking(response).lower()
+    last_valid: SakhaAction | None = None
+    for match in _ACTION_RE.finditer(cleaned):
         name = match.group(1)
+        if name not in ACTION_NAME_MAP:
+            continue
         patient_id = int(match.group(2)) if match.group(2) else None
-        if name in ACTION_NAME_MAP:
-            return SakhaAction(action_type=ACTION_NAME_MAP[name], patient_id=patient_id), True
+        last_valid = SakhaAction(
+            action_type=ACTION_NAME_MAP[name], patient_id=patient_id
+        )
+    if last_valid is not None:
+        return last_valid, True
     return SakhaAction(action_type=ActionType.NOOP, patient_id=None), False
 
 

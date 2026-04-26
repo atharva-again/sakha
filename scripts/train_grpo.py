@@ -12,7 +12,6 @@ import os
 # Prevent vLLM from reconfiguring logging (crashes Jupyter/Colab's OutStream)
 os.environ["VLLM_CONFIGURE_LOGGING"] = "0"
 
-import re
 import json
 import gc
 import torch
@@ -23,12 +22,11 @@ from tqdm import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from sakha.env import SakhaEnvironment
 from sakha.grpo_training import (
-    ACTION_NAME_MAP,
     build_grpo_prompt,
     build_state_aligned_examples,
+    parse_action_response_with_status,
     score_completion_action,
 )
-from sakha.models import SakhaAction, ActionType
 from sakha.graders import score_easy_task, score_medium_task, score_hard_task
 
 # ============================================================
@@ -163,14 +161,9 @@ def build_eval_prompt(obs):
     )
 
 def parse_action_response(response):
-    response = response.strip().lower()
-    match = re.search(r"(\w+)\s*\(\s*(\d+)?\s*\)", response)
-    if match:
-        name = match.group(1)
-        patient_id = int(match.group(2)) if match.group(2) else None
-        if name in ACTION_NAME_MAP:
-            return SakhaAction(action_type=ACTION_NAME_MAP[name], patient_id=patient_id)
-    return SakhaAction(action_type=ActionType.NOOP, patient_id=None)
+    """Thin wrapper kept for callers that don't care about the parse status flag."""
+    action, _ = parse_action_response_with_status(response)
+    return action
 
 def save_eval_cache(results, cache_path):
     """Save evaluation results to JSON for resume across sessions."""
